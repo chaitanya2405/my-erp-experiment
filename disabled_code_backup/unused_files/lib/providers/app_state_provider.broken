@@ -1,0 +1,1220 @@
+import 'dart:async';
+import 'package:flutter/foundation.dart';
+import 'package:flutter_riverpod/flutter_riverpod.dart';
+import 'package:cloud_firestore/cloud_firestore.dart';
+import 'package:firebase_auth/firebase_auth.dart';
+import 'package:firebase_storage/firebase_storage.dart';
+import '../models/product.dart';
+import '../models/inventory_models.dart';
+import '../models/supplier.dart';
+import '../models/purchase_order.dart';
+import '../models/order.dart';
+import '../models/customer_profile.dart';
+import '../models/user_profile.dart';
+
+// ==================== GLOBAL APP STATE ====================
+
+/// Global application state
+class AppState {
+  final bool isInitialized;
+  final bool isAuthenticated;
+  final User? currentUser;
+  final UserProfile? userProfile;
+  final bool isLoading;
+  final String? errorMessage;
+  final Map<String, dynamic> cache;
+  final AppThemeMode themeMode;
+  final AppLanguage language;
+  
+  const AppState({
+    this.isInitialized = false,
+    this.isAuthenticated = false,
+    this.currentUser,
+    this.userProfile,
+    this.isLoading = false,
+    this.errorMessage,
+    this.cache = const {},
+    this.themeMode = AppThemeMode.light,
+    this.language = AppLanguage.english,
+  });
+  
+  AppState copyWith({
+    bool? isInitialized,
+    bool? isAuthenticated,
+    User? currentUser,
+    UserProfile? userProfile,
+    bool? isLoading,
+    String? errorMessage,
+    Map<String, dynamic>? cache,
+    AppThemeMode? themeMode,
+    AppLanguage? language,
+  }) {
+    return AppState(
+      isInitialized: isInitialized ?? this.isInitialized,
+      isAuthenticated: isAuthenticated ?? this.isAuthenticated,
+      currentUser: currentUser ?? this.currentUser,
+      userProfile: userProfile ?? this.userProfile,
+      isLoading: isLoading ?? this.isLoading,
+      errorMessage: errorMessage ?? this.errorMessage,
+      cache: cache ?? this.cache,
+      themeMode: themeMode ?? this.themeMode,
+      language: language ?? this.language,
+    );
+  }
+  
+  AppState clearError() {
+    return copyWith(errorMessage: null);
+  }
+  
+  AppState setLoading(bool loading) {
+    return copyWith(isLoading: loading);
+  }
+}
+
+enum AppThemeMode { light, dark, system }
+enum AppLanguage { english, hindi, telugu, tamil }
+
+/// Global app state provider
+final appStateProvider = StateNotifierProvider<AppStateNotifier, AppState>((ref) {
+  return AppStateNotifier(ref);
+});
+
+/// App state notifier to manage global state changes
+class AppStateNotifier extends StateNotifier<AppState> {
+  final Ref _ref;
+  StreamSubscription? _authSubscription;
+  
+  AppStateNotifier(this._ref) : super(const AppState()) {
+    _initialize();
+  }
+  
+  Future<void> _initialize() async {
+    state = state.copyWith(isLoading: true);
+    
+    try {
+      // Listen to auth state changes
+      _authSubscription = FirebaseAuth.instance.authStateChanges().listen((user) {
+        state = state.copyWith(
+          currentUser: user,
+          isAuthenticated: user != null,
+        );
+        
+        if (user != null) {
+          _loadUserProfile(user.uid);
+        }
+      });
+      
+      state = state.copyWith(
+        isInitialized: true,
+        isLoading: false,
+      );
+    } catch (e) {
+      state = state.copyWith(
+        isLoading: false,
+        errorMessage: 'Failed to initialize app: ${e.toString()}',
+      );
+    }
+  }
+  
+  Future<void> _loadUserProfile(String userId) async {
+    try {
+      final docSnapshot = await FirebaseFirestore.instance
+          .collection('users')
+          .doc(userId)
+          .get();
+          
+      if (docSnapshot.exists) {
+        final data = docSnapshot.data() as Map<String, dynamic>;
+        final userProfile = UserProfile.fromFirestore(docSnapshot);
+        state = state.copyWith(userProfile: userProfile);
+      }
+    } catch (e) {
+      state = state.copyWith(
+        errorMessage: 'Failed to load user profile: ${e.toString()}',
+      );
+    }
+  }
+  
+  void setThemeMode(AppThemeMode mode) {
+    state = state.copyWith(themeMode: mode);
+  }
+  
+  void setLanguage(AppLanguage language) {
+    state = state.copyWith(language: language);
+  }
+  
+  void clearError() {
+    state = state.clearError();
+  }
+  
+  @override
+  void dispose() {
+    _authSubscription?.cancel();
+    super.dispose();
+  }
+}
+
+// ==================== MODULE-SPECIFIC PROVIDERS ====================
+
+// ----- Product Management Providers -----
+
+/// Product state class
+class ProductState {
+  final List<Product> products;
+  final bool isLoading;
+  final String? errorMessage;
+  final Map<String, Product> productCache;
+  
+  const ProductState({
+    this.products = const [],
+    this.isLoading = false,
+    this.errorMessage,
+    this.productCache = const {},
+  });
+  
+  ProductState copyWith({
+    List<Product>? products,
+    bool? isLoading,
+    String? errorMessage,
+    Map<String, Product>? productCache,
+  }) {
+    return ProductState(
+      products: products ?? this.products,
+      isLoading: isLoading ?? this.isLoading,
+      errorMessage: errorMessage ?? this.errorMessage,
+      productCache: productCache ?? this.productCache,
+    );
+  }
+}
+
+/// Product state notifier
+class ProductStateNotifier extends StateNotifier<ProductState> {
+  final Ref _ref;
+  StreamSubscription? _productsSubscription;
+  
+  ProductStateNotifier(this._ref) : super(const ProductState()) {
+    _initializeProducts();
+  }
+  
+  Future<void> _initializeProducts() async {
+    state = state.copyWith(isLoading: true);
+    
+    try {
+      // Listen to product changes
+      _productsSubscription = FirebaseFirestore.instance
+          .collection('products')
+          .where('deleted_at', isNull: true)
+          .snapshots()
+          .listen((snapshot) {
+        final products = snapshot.docs
+            .map((doc) => Product.fromFirestore(doc))
+            .toList();
+            
+        // Update product cache
+        final Map<String, Product> updatedCache = {};
+        for (final product in products) {
+          updatedCache[product.productId] = product;
+        }
+        
+        state = state.copyWith(
+          products: products,
+          isLoading: false,
+          productCache: updatedCache,
+        );
+        
+        // Notify event bus of product data update
+        _ref.read(eventBusProvider).emit(
+          AppEvent(
+            type: EventType.productsUpdated,
+            payload: products,
+          ),
+        );
+      });
+    } catch (e) {
+      state = state.copyWith(
+        isLoading: false,
+        errorMessage: 'Failed to load products: ${e.toString()}',
+      );
+    }
+  }
+  
+  Future<Product?> getProductById(String productId) async {
+    // Check cache first
+    if (state.productCache.containsKey(productId)) {
+      return state.productCache[productId];
+    }
+    
+    try {
+      final docSnapshot = await FirebaseFirestore.instance
+          .collection('products')
+          .doc(productId)
+          .get();
+          
+      if (docSnapshot.exists) {
+        final product = Product.fromFirestore(docSnapshot);
+        
+        // Update cache
+        final updatedCache = Map<String, Product>.from(state.productCache);
+        updatedCache[productId] = product;
+        
+        state = state.copyWith(productCache: updatedCache);
+        return product;
+      }
+      return null;
+    } catch (e) {
+      state = state.copyWith(
+        errorMessage: 'Failed to get product: ${e.toString()}',
+      );
+      return null;
+    }
+  }
+  
+  @override
+  void dispose() {
+    _productsSubscription?.cancel();
+    super.dispose();
+  }
+}
+
+/// Product state provider
+final productStateProvider = StateNotifierProvider<ProductStateNotifier, ProductState>((ref) {
+  return ProductStateNotifier(ref);
+});
+
+/// Stream of all products
+final productsStreamProvider = StreamProvider<List<Product>>((ref) {
+  return FirebaseFirestore.instance
+      .collection('products')
+      .where('deleted_at', isNull: true)
+      .snapshots()
+      .map((snapshot) => snapshot.docs
+          .map((doc) => Product.fromFirestore(doc))
+          .toList());
+});
+
+// ----- Inventory Management Providers -----
+
+/// Inventory state class
+class InventoryState {
+  final List<InventoryItem> inventoryItems;
+  final bool isLoading;
+  final String? errorMessage;
+  final Map<String, InventoryItem> inventoryCache;
+  
+  const InventoryState({
+    this.inventoryItems = const [],
+    this.isLoading = false,
+    this.errorMessage,
+    this.inventoryCache = const {},
+  });
+  
+  InventoryState copyWith({
+    List<InventoryItem>? inventoryItems,
+    bool? isLoading,
+    String? errorMessage,
+    Map<String, InventoryItem>? inventoryCache,
+  }) {
+    return InventoryState(
+      inventoryItems: inventoryItems ?? this.inventoryItems,
+      isLoading: isLoading ?? this.isLoading,
+      errorMessage: errorMessage ?? this.errorMessage,
+      inventoryCache: inventoryCache ?? this.inventoryCache,
+    );
+  }
+}
+
+/// Inventory state notifier
+class InventoryStateNotifier extends StateNotifier<InventoryState> {
+  final Ref _ref;
+  StreamSubscription? _inventorySubscription;
+  
+  InventoryStateNotifier(this._ref) : super(const InventoryState()) {
+    _initializeInventory();
+  }
+  
+  Future<void> _initializeInventory() async {
+    state = state.copyWith(isLoading: true);
+    
+    try {
+      // Listen to inventory changes
+      _inventorySubscription = FirebaseFirestore.instance
+          .collection('inventory')
+          .snapshots()
+          .listen((snapshot) {
+        final inventoryItems = snapshot.docs
+            .map((doc) => InventoryItem.fromFirestore(doc))
+            .toList();
+            
+        // Update inventory cache
+        final Map<String, InventoryItem> updatedCache = {};
+        for (final item in inventoryItems) {
+          updatedCache[item.inventoryId] = item;
+        }
+        
+        state = state.copyWith(
+          inventoryItems: inventoryItems,
+          isLoading: false,
+          inventoryCache: updatedCache,
+        );
+        
+        // Notify event bus of inventory data update
+        _ref.read(eventBusProvider).emit(
+          AppEvent(
+            type: EventType.inventoryUpdated,
+            payload: inventoryItems,
+          ),
+        );
+      });
+    } catch (e) {
+      state = state.copyWith(
+        isLoading: false,
+        errorMessage: 'Failed to load inventory: ${e.toString()}',
+      );
+    }
+  }
+  
+  @override
+  void dispose() {
+    _inventorySubscription?.cancel();
+    super.dispose();
+  }
+}
+
+/// Inventory state provider
+final inventoryStateProvider = StateNotifierProvider<InventoryStateNotifier, InventoryState>((ref) {
+  return InventoryStateNotifier(ref);
+});
+
+// ----- Supplier Management Providers -----
+
+/// Supplier state class
+class SupplierState {
+  final List<Supplier> suppliers;
+  final bool isLoading;
+  final String? errorMessage;
+  final Map<String, Supplier> supplierCache;
+  
+  const SupplierState({
+    this.suppliers = const [],
+    this.isLoading = false,
+    this.errorMessage,
+    this.supplierCache = const {},
+  });
+  
+  SupplierState copyWith({
+    List<Supplier>? suppliers,
+    bool? isLoading,
+    String? errorMessage,
+    Map<String, Supplier>? supplierCache,
+  }) {
+    return SupplierState(
+      suppliers: suppliers ?? this.suppliers,
+      isLoading: isLoading ?? this.isLoading,
+      errorMessage: errorMessage ?? this.errorMessage,
+      supplierCache: supplierCache ?? this.supplierCache,
+    );
+  }
+}
+
+/// Supplier state notifier
+class SupplierStateNotifier extends StateNotifier<SupplierState> {
+  final Ref _ref;
+  StreamSubscription? _supplierSubscription;
+  
+  SupplierStateNotifier(this._ref) : super(const SupplierState()) {
+    _initializeSuppliers();
+  }
+  
+  Future<void> _initializeSuppliers() async {
+    state = state.copyWith(isLoading: true);
+    
+    try {
+      // Listen to supplier changes
+      _supplierSubscription = FirebaseFirestore.instance
+          .collection('suppliers')
+          .where('deleted_at', isNull: true)
+          .snapshots()
+          .listen((snapshot) {
+        final suppliers = snapshot.docs
+            .map((doc) => Supplier.fromFirestore(doc))
+            .toList();
+            
+        // Update supplier cache
+        final Map<String, Supplier> updatedCache = {};
+        for (final supplier in suppliers) {
+          updatedCache[supplier.supplierId] = supplier;
+        }
+        
+        state = state.copyWith(
+          suppliers: suppliers,
+          isLoading: false,
+          supplierCache: updatedCache,
+        );
+        
+        // Notify event bus of supplier data update
+        _ref.read(eventBusProvider).emit(
+          AppEvent(
+            type: EventType.suppliersUpdated,
+            payload: suppliers,
+          ),
+        );
+      });
+    } catch (e) {
+      state = state.copyWith(
+        isLoading: false,
+        errorMessage: 'Failed to load suppliers: ${e.toString()}',
+      );
+    }
+  }
+  
+  @override
+  void dispose() {
+    _supplierSubscription?.cancel();
+    super.dispose();
+  }
+}
+
+/// Supplier state provider
+final supplierStateProvider = StateNotifierProvider<SupplierStateNotifier, SupplierState>((ref) {
+  return SupplierStateNotifier(ref);
+});
+
+// ----- Purchase Order Management Providers -----
+
+/// Purchase order state class
+class PurchaseOrderState {
+  final List<PurchaseOrder> purchaseOrders;
+  final bool isLoading;
+  final String? errorMessage;
+  final Map<String, PurchaseOrder> poCache;
+  
+  const PurchaseOrderState({
+    this.purchaseOrders = const [],
+    this.isLoading = false,
+    this.errorMessage,
+    this.poCache = const {},
+  });
+  
+  PurchaseOrderState copyWith({
+    List<PurchaseOrder>? purchaseOrders,
+    bool? isLoading,
+    String? errorMessage,
+    Map<String, PurchaseOrder>? poCache,
+  }) {
+    return PurchaseOrderState(
+      purchaseOrders: purchaseOrders ?? this.purchaseOrders,
+      isLoading: isLoading ?? this.isLoading,
+      errorMessage: errorMessage ?? this.errorMessage,
+      poCache: poCache ?? this.poCache,
+    );
+  }
+}
+
+/// Purchase order state notifier
+class PurchaseOrderStateNotifier extends StateNotifier<PurchaseOrderState> {
+  final Ref _ref;
+  StreamSubscription? _poSubscription;
+  
+  PurchaseOrderStateNotifier(this._ref) : super(const PurchaseOrderState()) {
+    _initializePurchaseOrders();
+  }
+  
+  Future<void> _initializePurchaseOrders() async {
+    state = state.copyWith(isLoading: true);
+    
+    try {
+      // Listen to purchase order changes
+      _poSubscription = FirebaseFirestore.instance
+          .collection('purchase_orders')
+          .orderBy('created_at', descending: true)
+          .snapshots()
+          .listen((snapshot) {
+        final purchaseOrders = snapshot.docs
+            .map((doc) => PurchaseOrder.fromFirestore(doc))
+            .toList();
+            
+        // Update PO cache
+        final Map<String, PurchaseOrder> updatedCache = {};
+        for (final po in purchaseOrders) {
+          updatedCache[po.poId] = po;
+        }
+        
+        state = state.copyWith(
+          purchaseOrders: purchaseOrders,
+          isLoading: false,
+          poCache: updatedCache,
+        );
+        
+        // Notify event bus of PO data update
+        _ref.read(eventBusProvider).emit(
+          AppEvent(
+            type: EventType.purchaseOrdersUpdated,
+            payload: purchaseOrders,
+          ),
+        );
+      });
+    } catch (e) {
+      state = state.copyWith(
+        isLoading: false,
+        errorMessage: 'Failed to load purchase orders: ${e.toString()}',
+      );
+    }
+  }
+  
+  @override
+  void dispose() {
+    _poSubscription?.cancel();
+    super.dispose();
+  }
+}
+
+/// Purchase order state provider
+final purchaseOrderStateProvider = StateNotifierProvider<PurchaseOrderStateNotifier, PurchaseOrderState>((ref) {
+  return PurchaseOrderStateNotifier(ref);
+});
+
+// ----- Customer Order Management Providers -----
+
+/// Customer order state class
+class CustomerOrderState {
+  final List<Order> customerOrders;
+  final bool isLoading;
+  final String? errorMessage;
+  final Map<String, Order> orderCache;
+  
+  const CustomerOrderState({
+    this.customerOrders = const [],
+    this.isLoading = false,
+    this.errorMessage,
+    this.orderCache = const {},
+  });
+  
+  CustomerOrderState copyWith({
+    List<Order>? customerOrders,
+    bool? isLoading,
+    String? errorMessage,
+    Map<String, Order>? orderCache,
+  }) {
+    return CustomerOrderState(
+      customerOrders: customerOrders ?? this.customerOrders,
+      isLoading: isLoading ?? this.isLoading,
+      errorMessage: errorMessage ?? this.errorMessage,
+      orderCache: orderCache ?? this.orderCache,
+    );
+  }
+}
+
+/// Customer order state notifier
+class CustomerOrderStateNotifier extends StateNotifier<CustomerOrderState> {
+  final Ref _ref;
+  StreamSubscription? _orderSubscription;
+  
+  CustomerOrderStateNotifier(this._ref) : super(const CustomerOrderState()) {
+    _initializeCustomerOrders();
+  }
+  
+  Future<void> _initializeCustomerOrders() async {
+    state = state.copyWith(isLoading: true);
+    
+    try {
+      // Listen to customer order changes
+      _orderSubscription = FirebaseFirestore.instance
+          .collection('orders')
+          .orderBy('created_at', descending: true)
+          .snapshots()
+          .listen((snapshot) {
+        final customerOrders = snapshot.docs
+            .map((doc) => Order.fromFirestore(doc))
+            .toList();
+            
+        // Update order cache
+        final Map<String, Order> updatedCache = {};
+        for (final order in customerOrders) {
+          updatedCache[order.orderId] = order;
+        }
+        
+        state = state.copyWith(
+          customerOrders: customerOrders,
+          isLoading: false,
+          orderCache: updatedCache,
+        );
+        
+        // Notify event bus of order data update
+        _ref.read(eventBusProvider).emit(
+          AppEvent(
+            type: EventType.customerOrdersUpdated,
+            payload: customerOrders,
+          ),
+        );
+      });
+    } catch (e) {
+      state = state.copyWith(
+        isLoading: false,
+        errorMessage: 'Failed to load customer orders: ${e.toString()}',
+      );
+    }
+  }
+  
+  @override
+  void dispose() {
+    _orderSubscription?.cancel();
+    super.dispose();
+  }
+}
+
+/// Customer order state provider
+final customerOrderStateProvider = StateNotifierProvider<CustomerOrderStateNotifier, CustomerOrderState>((ref) {
+  return CustomerOrderStateNotifier(ref);
+});
+
+// ----- Customer Profile Management Providers -----
+
+/// Customer profile state class
+class CustomerProfileState {
+  final List<CustomerProfile> customerProfiles;
+  final bool isLoading;
+  final String? errorMessage;
+  final Map<String, CustomerProfile> profileCache;
+  
+  const CustomerProfileState({
+    this.customerProfiles = const [],
+    this.isLoading = false,
+    this.errorMessage,
+    this.profileCache = const {},
+  });
+  
+  CustomerProfileState copyWith({
+    List<CustomerProfile>? customerProfiles,
+    bool? isLoading,
+    String? errorMessage,
+    Map<String, CustomerProfile>? profileCache,
+  }) {
+    return CustomerProfileState(
+      customerProfiles: customerProfiles ?? this.customerProfiles,
+      isLoading: isLoading ?? this.isLoading,
+      errorMessage: errorMessage ?? this.errorMessage,
+      profileCache: profileCache ?? this.profileCache,
+    );
+  }
+}
+
+/// Customer profile state notifier
+class CustomerProfileStateNotifier extends StateNotifier<CustomerProfileState> {
+  final Ref _ref;
+  StreamSubscription? _profileSubscription;
+  
+  CustomerProfileStateNotifier(this._ref) : super(const CustomerProfileState()) {
+    _initializeCustomerProfiles();
+  }
+  
+  Future<void> _initializeCustomerProfiles() async {
+    state = state.copyWith(isLoading: true);
+    
+    try {
+      // Listen to customer profile changes
+      _profileSubscription = FirebaseFirestore.instance
+          .collection('customer_profiles')
+          .where('deleted_at', isNull: true)
+          .snapshots()
+          .listen((snapshot) {
+        final customerProfiles = snapshot.docs
+            .map((doc) => CustomerProfile.fromFirestore(doc))
+            .toList();
+            
+        // Update profile cache
+        final Map<String, CustomerProfile> updatedCache = {};
+        for (final profile in customerProfiles) {
+          updatedCache[profile.customerId] = profile;
+        }
+        
+        state = state.copyWith(
+          customerProfiles: customerProfiles,
+          isLoading: false,
+          profileCache: updatedCache,
+        );
+        
+        // Notify event bus of profile data update
+        _ref.read(eventBusProvider).emit(
+          AppEvent(
+            type: EventType.customerProfilesUpdated,
+            payload: customerProfiles,
+          ),
+        );
+      });
+    } catch (e) {
+      state = state.copyWith(
+        isLoading: false,
+        errorMessage: 'Failed to load customer profiles: ${e.toString()}',
+      );
+    }
+  }
+  
+  @override
+  void dispose() {
+    _profileSubscription?.cancel();
+    super.dispose();
+  }
+}
+
+/// Customer profile state provider
+final customerProfileStateProvider = StateNotifierProvider<CustomerProfileStateNotifier, CustomerProfileState>((ref) {
+  return CustomerProfileStateNotifier(ref);
+});
+
+// ==================== SHARED STATE & EVENT BUS ====================
+
+/// Event types for cross-module communication
+enum EventType {
+  productsUpdated,
+  inventoryUpdated,
+  suppliersUpdated,
+  purchaseOrdersUpdated,
+  customerOrdersUpdated,
+  customerProfilesUpdated,
+  userUpdated,
+  lowStockAlert,
+  paymentReceived,
+  orderStatusChanged,
+  poStatusChanged,
+  supplierRatingChanged,
+  systemNotification,
+}
+
+/// Event class for the event bus
+class AppEvent {
+  final EventType type;
+  final dynamic payload;
+  final DateTime timestamp;
+  
+  AppEvent({
+    required this.type,
+    this.payload,
+    DateTime? timestamp,
+  }) : timestamp = timestamp ?? DateTime.now();
+}
+
+/// Event bus for cross-module communication
+class EventBus {
+  final _eventController = StreamController<AppEvent>.broadcast();
+  
+  Stream<AppEvent> get events => _eventController.stream;
+  
+  void emit(AppEvent event) {
+    _eventController.add(event);
+  }
+  
+  Stream<AppEvent> on(EventType type) {
+    return events.where((event) => event.type == type);
+  }
+  
+  void dispose() {
+    _eventController.close();
+  }
+}
+
+/// Event bus provider
+final eventBusProvider = Provider<EventBus>((ref) {
+  final eventBus = EventBus();
+  ref.onDispose(() {
+    eventBus.dispose();
+  });
+  return eventBus;
+});
+
+/// Listen to specific events
+final eventListenerProvider = StreamProvider.family<AppEvent, EventType>((ref, eventType) {
+  final eventBus = ref.watch(eventBusProvider);
+  return eventBus.on(eventType);
+});
+
+// ==================== CACHE MANAGEMENT ====================
+
+/// Cache configuration
+class CacheConfig {
+  final Duration defaultExpiry;
+  final int maxItems;
+  
+  const CacheConfig({
+    this.defaultExpiry = const Duration(minutes: 30),
+    this.maxItems = 100,
+  });
+}
+
+/// Cache entry with expiration
+class CacheEntry<T> {
+  final T value;
+  final DateTime expiresAt;
+  
+  CacheEntry({
+    required this.value,
+    required Duration expiry,
+  }) : expiresAt = DateTime.now().add(expiry);
+  
+  bool get isExpired => DateTime.now().isAfter(expiresAt);
+}
+
+/// Cache manager for improved performance
+class CacheManager {
+  final Map<String, CacheEntry<dynamic>> _cache = {};
+  final CacheConfig _config;
+  
+  CacheManager([CacheConfig? config]) : _config = config ?? const CacheConfig();
+  
+  T? get<T>(String key) {
+    final entry = _cache[key];
+    if (entry == null) return null;
+    
+    if (entry.isExpired) {
+      _cache.remove(key);
+      return null;
+    }
+    
+    return entry.value as T;
+  }
+  
+  void set<T>(String key, T value, {Duration? expiry}) {
+    // Enforce max items limit
+    if (_cache.length >= _config.maxItems && !_cache.containsKey(key)) {
+      // Remove oldest entry
+      final oldestKey = _cache.entries
+          .reduce((a, b) => a.value.expiresAt.isBefore(b.value.expiresAt) ? a : b)
+          .key;
+      _cache.remove(oldestKey);
+    }
+    
+    _cache[key] = CacheEntry<T>(
+      value: value,
+      expiry: expiry ?? _config.defaultExpiry,
+    );
+  }
+  
+  void remove(String key) {
+    _cache.remove(key);
+  }
+  
+  void clear() {
+    _cache.clear();
+  }
+  
+  void clearExpired() {
+    _cache.removeWhere((_, entry) => entry.isExpired);
+  }
+}
+
+/// Cache manager provider
+final cacheManagerProvider = Provider<CacheManager>((ref) {
+  final cacheManager = CacheManager();
+  ref.onDispose(() {
+    cacheManager.clear();
+  });
+  return cacheManager;
+});
+
+// ==================== REAL-TIME DATA SYNC ====================
+
+/// Dashboard data aggregator for real-time KPIs
+class DashboardData {
+  final int totalProducts;
+  final int lowStockItems;
+  final int outOfStockItems;
+  final int pendingOrders;
+  final int pendingPurchaseOrders;
+  final double totalSalesValue;
+  final double totalPurchaseValue;
+  final List<Map<String, dynamic>> salesTrend;
+  final List<Map<String, dynamic>> purchaseTrend;
+  final DateTime lastUpdated;
+  
+  DashboardData({
+    this.totalProducts = 0,
+    this.lowStockItems = 0,
+    this.outOfStockItems = 0,
+    this.pendingOrders = 0,
+    this.pendingPurchaseOrders = 0,
+    this.totalSalesValue = 0.0,
+    this.totalPurchaseValue = 0.0,
+    this.salesTrend = const [],
+    this.purchaseTrend = const [],
+    DateTime? lastUpdated,
+  }) : lastUpdated = lastUpdated ?? DateTime.now();
+  
+  DashboardData copyWith({
+    int? totalProducts,
+    int? lowStockItems,
+    int? outOfStockItems,
+    int? pendingOrders,
+    int? pendingPurchaseOrders,
+    double? totalSalesValue,
+    double? totalPurchaseValue,
+    List<Map<String, dynamic>>? salesTrend,
+    List<Map<String, dynamic>>? purchaseTrend,
+  }) {
+    return DashboardData(
+      totalProducts: totalProducts ?? this.totalProducts,
+      lowStockItems: lowStockItems ?? this.lowStockItems,
+      outOfStockItems: outOfStockItems ?? this.outOfStockItems,
+      pendingOrders: pendingOrders ?? this.pendingOrders,
+      pendingPurchaseOrders: pendingPurchaseOrders ?? this.pendingPurchaseOrders,
+      totalSalesValue: totalSalesValue ?? this.totalSalesValue,
+      totalPurchaseValue: totalPurchaseValue ?? this.totalPurchaseValue,
+      salesTrend: salesTrend ?? this.salesTrend,
+      purchaseTrend: purchaseTrend ?? this.purchaseTrend,
+      lastUpdated: DateTime.now(),
+    );
+  }
+}
+
+/// Dashboard data notifier
+class DashboardDataNotifier extends StateNotifier<DashboardData> {
+  final Ref _ref;
+  List<StreamSubscription> _subscriptions = [];
+  
+  DashboardDataNotifier(this._ref) : super(DashboardData()) {
+    _initializeDashboardData();
+  }
+  
+  void _initializeDashboardData() {
+    // Listen to all relevant events for dashboard updates
+    final eventBus = _ref.read(eventBusProvider);
+    
+    // Update dashboard when products change
+    _subscriptions.add(
+      eventBus.on(EventType.productsUpdated).listen((event) {
+        final products = event.payload as List<Product>;
+        state = state.copyWith(
+          totalProducts: products.length,
+        );
+      })
+    );
+    
+    // Update dashboard when inventory changes
+    _subscriptions.add(
+      eventBus.on(EventType.inventoryUpdated).listen((event) {
+        final inventory = event.payload as List<InventoryItem>;
+        final lowStockItems = inventory.where((item) => 
+          item.currentStock <= item.minStockLevel && item.currentStock > 0).length;
+        final outOfStockItems = inventory.where((item) => item.currentStock <= 0).length;
+        
+        state = state.copyWith(
+          lowStockItems: lowStockItems,
+          outOfStockItems: outOfStockItems,
+        );
+      })
+    );
+    
+    // Update dashboard when orders change
+    _subscriptions.add(
+      eventBus.on(EventType.customerOrdersUpdated).listen((event) {
+        final orders = event.payload as List<Order>;
+        final pendingOrders = orders.where((order) => 
+          order.orderStatus == 'pending' || order.orderStatus == 'processing').length;
+        final totalSalesValue = orders
+          .where((order) => order.orderStatus != 'cancelled')
+          .fold(0.0, (sum, order) => sum + (order.totalAmount ?? 0.0));
+        
+        // Generate sales trend data
+        final salesTrend = _generateTrendData(orders);
+        
+        state = state.copyWith(
+          pendingOrders: pendingOrders,
+          totalSalesValue: totalSalesValue,
+          salesTrend: salesTrend,
+        );
+      })
+    );
+    
+    // Update dashboard when purchase orders change
+    _subscriptions.add(
+      eventBus.on(EventType.purchaseOrdersUpdated).listen((event) {
+        final purchaseOrders = event.payload as List<PurchaseOrder>;
+        final pendingPOs = purchaseOrders.where((po) => 
+          po.poStatus == 'pending' || po.poStatus == 'approved').length;
+        final totalPurchaseValue = purchaseOrders
+          .where((po) => po.poStatus != 'cancelled')
+          .fold(0.0, (sum, po) => sum + (po.totalAmount ?? 0.0));
+        
+        // Generate purchase trend data
+        final purchaseTrend = _generatePurchaseTrendData(purchaseOrders);
+        
+        state = state.copyWith(
+          pendingPurchaseOrders: pendingPOs,
+          totalPurchaseValue: totalPurchaseValue,
+          purchaseTrend: purchaseTrend,
+        );
+      })
+    );
+  }
+  
+  List<Map<String, dynamic>> _generateTrendData(List<Order> orders) {
+    // Group orders by date and calculate daily totals
+    final Map<String, double> dailyTotals = {};
+    final now = DateTime.now();
+    
+    // Initialize last 30 days with zero values
+    for (int i = 29; i >= 0; i--) {
+      final date = now.subtract(Duration(days: i));
+      final dateString = '${date.year}-${date.month.toString().padLeft(2, '0')}-${date.day.toString().padLeft(2, '0')}';
+      dailyTotals[dateString] = 0.0;
+    }
+    
+    // Fill in actual values
+    for (final order in orders) {
+      if (order.orderStatus != 'cancelled' && order.createdAt != null) {
+        final date = order.createdAt!.toDate();
+        if (now.difference(date).inDays <= 30) {
+          final dateString = '${date.year}-${date.month.toString().padLeft(2, '0')}-${date.day.toString().padLeft(2, '0')}';
+          dailyTotals[dateString] = (dailyTotals[dateString] ?? 0.0) + (order.totalAmount ?? 0.0);
+        }
+      }
+    }
+    
+    // Convert to list for chart display
+    return dailyTotals.entries.map((entry) {
+      return {
+        'date': entry.key,
+        'value': entry.value,
+      };
+    }).toList()..sort((a, b) => a['date'].compareTo(b['date']));
+  }
+  
+  List<Map<String, dynamic>> _generatePurchaseTrendData(List<PurchaseOrder> purchaseOrders) {
+    // Similar logic as sales trend but for purchase orders
+    final Map<String, double> dailyTotals = {};
+    final now = DateTime.now();
+    
+    // Initialize last 30 days with zero values
+    for (int i = 29; i >= 0; i--) {
+      final date = now.subtract(Duration(days: i));
+      final dateString = '${date.year}-${date.month.toString().padLeft(2, '0')}-${date.day.toString().padLeft(2, '0')}';
+      dailyTotals[dateString] = 0.0;
+    }
+    
+    // Fill in actual values
+    for (final po in purchaseOrders) {
+      if (po.poStatus != 'cancelled' && po.createdAt != null) {
+        final date = po.createdAt!.toDate();
+        if (now.difference(date).inDays <= 30) {
+          final dateString = '${date.year}-${date.month.toString().padLeft(2, '0')}-${date.day.toString().padLeft(2, '0')}';
+          dailyTotals[dateString] = (dailyTotals[dateString] ?? 0.0) + (po.totalAmount ?? 0.0);
+        }
+      }
+    }
+    
+    // Convert to list for chart display
+    return dailyTotals.entries.map((entry) {
+      return {
+        'date': entry.key,
+        'value': entry.value,
+      };
+    }).toList()..sort((a, b) => a['date'].compareTo(b['date']));
+  }
+  
+  @override
+  void dispose() {
+    for (final subscription in _subscriptions) {
+      subscription.cancel();
+    }
+    super.dispose();
+  }
+}
+
+/// Dashboard data provider
+final dashboardDataProvider = StateNotifierProvider<DashboardDataNotifier, DashboardData>((ref) {
+  return DashboardDataNotifier(ref);
+});
+
+// ==================== ERROR HANDLING ====================
+
+/// Error state class
+class ErrorState {
+  final String? message;
+  final StackTrace? stackTrace;
+  final DateTime? timestamp;
+  final String? code;
+  final String? module;
+  
+  const ErrorState({
+    this.message,
+    this.stackTrace,
+    this.timestamp,
+    this.code,
+    this.module,
+  });
+  
+  bool get hasError => message != null;
+  
+  ErrorState copyWith({
+    String? message,
+    StackTrace? stackTrace,
+    DateTime? timestamp,
+    String? code,
+    String? module,
+  }) {
+    return ErrorState(
+      message: message ?? this.message,
+      stackTrace: stackTrace ?? this.stackTrace,
+      timestamp: timestamp ?? this.timestamp,
+      code: code ?? this.code,
+      module: module ?? this.module,
+    );
+  }
+  
+  ErrorState clear() {
+    return const ErrorState();
+  }
+}
+
+/// Global error handling provider
+final errorStateProvider = StateProvider<ErrorState>((ref) {
+  return const ErrorState();
+});
+
+/// Error handling utility
+class ErrorHandler {
+  final Ref _ref;
+  
+  ErrorHandler(this._ref);
+  
+  void handleError(dynamic error, {String? module, String? code, StackTrace? stackTrace}) {
+    final errorMessage = error is Exception || error is Error
+        ? error.toString()
+        : error?.toString() ?? 'Unknown error occurred';
+    
+    // Update error state
+    _ref.read(errorStateProvider.notifier).state = ErrorState(
+      message: errorMessage,
+      stackTrace: stackTrace,
+      timestamp: DateTime.now(),
+      code: code,
+      module: module,
+    );
+    
+    // Log error
+    debugPrint('ERROR [$module] $errorMessage');
+    if (stackTrace != null) {
+      debugPrint(stackTrace.toString());
+    }
+    
+    // Emit error event
+    _ref.read(eventBusProvider).emit(
+      AppEvent(
+        type: EventType.systemNotification,
+        payload: {
+          'type': 'error',
+          'message': errorMessage,
+          'module': module,
+          'code': code,
+        },
+      ),
+    );
+  }
+  
+  void clearError() {
+    _ref.read(errorStateProvider.notifier).state = const ErrorState();
+  }
+}
+
+/// Error handler provider
+final errorHandlerProvider = Provider<ErrorHandler>((ref) {
+  return ErrorHandler(ref);
+});

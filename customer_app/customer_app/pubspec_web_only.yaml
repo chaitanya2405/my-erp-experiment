@@ -1,0 +1,57 @@
+name: customer_app
+description: Complete Customer ERP Portal - Production Ready (Web Only)
+version: 1.0.0+1
+
+environment:
+  sdk: '>=3.0.0 <4.0.0'
+
+dependencies:
+  flutter:
+    sdk: flutter
+  
+  # State Management
+  provider: ^6.1.1
+  
+  # UI & Icons
+  cupertino_icons: ^1.0.6
+  material_design_icons_flutter: ^7.0.7296
+  
+  # Networking & HTTP
+  http: ^1.1.2
+  dio: ^5.4.0
+  
+  # Storage & Database
+  shared_preferences: ^2.5.3
+  
+  # Media & Files
+  image_picker: ^1.1.2
+  cached_network_image: ^3.4.1
+  
+  # Utils & Helpers
+  intl: ^0.18.1
+  uuid: ^4.5.1
+  url_launcher: ^6.3.1
+  lottie: ^2.7.0
+  shimmer: ^3.0.0
+  
+  # Device & Network
+  device_info_plus: ^9.1.2
+  connectivity_plus: ^5.0.2
+
+dev_dependencies:
+  flutter_test:
+    sdk: flutter
+  flutter_lints: ^3.0.2
+  integration_test:
+    sdk: flutter
+
+flutter:
+  uses-material-design: true
+
+  assets:
+    - assets/fonts/
+
+  fonts:
+    - family: NotoColorEmoji
+      fonts:
+        - asset: fonts/NotoColorEmoji.ttf

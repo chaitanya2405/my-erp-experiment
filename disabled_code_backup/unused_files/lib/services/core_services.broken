@@ -1,0 +1,2260 @@
+import 'dart:async';
+import 'package:cloud_firestore/cloud_firestore.dart';
+import 'package:firebase_auth/firebase_auth.dart';
+import 'package:firebase_storage/firebase_storage.dart';
+import 'package:flutter/foundation.dart';
+import 'package:uuid/uuid.dart';
+import '../models/product.dart';
+import '../models/inventory_models.dart';
+import '../models/supplier.dart';
+import '../models/purchase_order.dart';
+import '../models/po_line_item.dart';
+import '../models/order.dart';
+import '../models/customer_profile.dart';
+import '../models/user_profile.dart';
+import '../models/supplier_service.dart';
+import '../models/missing_models.dart';
+
+// ==================== ERROR HANDLING ====================
+
+/// Custom exception for business logic errors
+class BusinessException implements Exception {
+  final String message;
+  final String? code;
+  final String? module;
+  final dynamic data;
+
+  BusinessException(this.message, {this.code, this.module, this.data});
+
+  @override
+  String toString() => 'BusinessException: $message (Code: $code, Module: $module)';
+}
+
+/// Custom exception for validation errors
+class ValidationException implements Exception {
+  final String message;
+  final Map<String, String> fieldErrors;
+  final String? module;
+
+  ValidationException(this.message, {this.fieldErrors = const {}, this.module});
+
+  @override
+  String toString() => 'ValidationException: $message (Module: $module)';
+}
+
+/// Error handler for services
+class ServiceErrorHandler {
+  static void handleError(dynamic error, {String? module, String? operation, dynamic data}) {
+    final timestamp = DateTime.now();
+    final errorId = const Uuid().v4();
+    
+    // Format error message
+    String errorMessage;
+    if (error is FirebaseException) {
+      errorMessage = 'Firebase Error: ${error.code} - ${error.message}';
+    } else if (error is BusinessException || error is ValidationException) {
+      errorMessage = error.toString();
+    } else {
+      errorMessage = error?.toString() ?? 'Unknown error occurred';
+    }
+    
+    // Log error details
+    debugPrint('=== ERROR [$errorId] ===');
+    debugPrint('Module: $module');
+    debugPrint('Operation: $operation');
+    debugPrint('Timestamp: $timestamp');
+    debugPrint('Message: $errorMessage');
+    
+    if (data != null) {
+      debugPrint('Data: ${data.toString()}');
+    }
+    
+    // In production, you might want to send this to a logging service
+    // or store in Firebase for later analysis
+    try {
+      FirebaseFirestore.instance.collection('error_logs').add({
+        'error_id': errorId,
+        'module': module,
+        'operation': operation,
+        'timestamp': timestamp,
+        'message': errorMessage,
+        'data': data?.toString(),
+      });
+    } catch (e) {
+      // Fail silently if we can't log the error
+      debugPrint('Failed to log error to Firestore: ${e.toString()}');
+    }
+    
+    // Re-throw the original error for handling upstream
+    throw error;
+  }
+}
+
+// ==================== AUDIT LOGGING ====================
+
+/// Audit log service for tracking activities
+class AuditService {
+  final FirebaseFirestore _firestore;
+  final FirebaseAuth _auth;
+  
+  AuditService({
+    FirebaseFirestore? firestore,
+    FirebaseAuth? auth,
+  }) : 
+    _firestore = firestore ?? FirebaseFirestore.instance,
+    _auth = auth ?? FirebaseAuth.instance;
+  
+  /// Log an activity
+  Future<void> logActivity({
+    required String module,
+    required String action,
+    required String entityType,
+    required String entityId,
+    Map<String, dynamic>? before,
+    Map<String, dynamic>? after,
+    String? notes,
+  }) async {
+    try {
+      final currentUser = _auth.currentUser;
+      final timestamp = FieldValue.serverTimestamp();
+      
+      await _firestore.collection('audit_logs').add({
+        'module': module,
+        'action': action,
+        'entity_type': entityType,
+        'entity_id': entityId,
+        'before': before,
+        'after': after,
+        'notes': notes,
+        'user_id': currentUser?.uid ?? 'system',
+        'user_email': currentUser?.email ?? 'system',
+        'timestamp': timestamp,
+      });
+    } catch (e) {
+      debugPrint('Failed to log audit trail: ${e.toString()}');
+      // Don't throw here - audit logging should not break functionality
+    }
+  }
+  
+  /// Get audit logs for an entity
+  Stream<QuerySnapshot> getEntityLogs(String entityType, String entityId) {
+    return _firestore
+        .collection('audit_logs')
+        .where('entity_type', isEqualTo: entityType)
+        .where('entity_id', isEqualTo: entityId)
+        .orderBy('timestamp', descending: true)
+        .snapshots();
+  }
+  
+  /// Get user activity logs
+  Stream<QuerySnapshot> getUserActivityLogs(String userId) {
+    return _firestore
+        .collection('audit_logs')
+        .where('user_id', isEqualTo: userId)
+        .orderBy('timestamp', descending: true)
+        .snapshots();
+  }
+  
+  /// Get module activity logs
+  Stream<QuerySnapshot> getModuleActivityLogs(String module) {
+    return _firestore
+        .collection('audit_logs')
+        .where('module', isEqualTo: module)
+        .orderBy('timestamp', descending: true)
+        .snapshots();
+  }
+}
+
+// ==================== VALIDATION SERVICE ====================
+
+/// Validation service for enforcing business rules
+class ValidationService {
+  // Product validation
+  Map<String, String> validateProduct(Map<String, dynamic> data) {
+    final errors = <String, String>{};
+    
+    if (data['product_name'] == null || (data['product_name'] as String).isEmpty) {
+      errors['product_name'] = 'Product name is required';
+    }
+    
+    if (data['sku'] == null || (data['sku'] as String).isEmpty) {
+      errors['sku'] = 'SKU is required';
+    }
+    
+    if (data['category'] == null || (data['category'] as String).isEmpty) {
+      errors['category'] = 'Category is required';
+    }
+    
+    if (data['unit'] == null || (data['unit'] as String).isEmpty) {
+      errors['unit'] = 'Unit is required';
+    }
+    
+    // Price validations
+    final mrp = data['mrp'] ?? 0;
+    final costPrice = data['cost_price'] ?? 0;
+    final sellingPrice = data['selling_price'] ?? 0;
+    
+    if (mrp < 0) {
+      errors['mrp'] = 'MRP cannot be negative';
+    }
+    
+    if (costPrice < 0) {
+      errors['cost_price'] = 'Cost price cannot be negative';
+    }
+    
+    if (sellingPrice < 0) {
+      errors['selling_price'] = 'Selling price cannot be negative';
+    }
+    
+    if (sellingPrice > mrp) {
+      errors['selling_price'] = 'Selling price cannot be greater than MRP';
+    }
+    
+    return errors;
+  }
+  
+  // Inventory validation
+  Map<String, String> validateInventory(Map<String, dynamic> data) {
+    final errors = <String, String>{};
+    
+    if (data['product_id'] == null || (data['product_id'] as String).isEmpty) {
+      errors['product_id'] = 'Product ID is required';
+    }
+    
+    if (data['warehouse_id'] == null || (data['warehouse_id'] as String).isEmpty) {
+      errors['warehouse_id'] = 'Warehouse ID is required';
+    }
+    
+    final currentStock = data['current_stock'] ?? 0;
+    if (currentStock < 0) {
+      errors['current_stock'] = 'Current stock cannot be negative';
+    }
+    
+    return errors;
+  }
+  
+  // Supplier validation
+  Map<String, String> validateSupplier(Map<String, dynamic> data) {
+    final errors = <String, String>{};
+    
+    if (data['supplier_name'] == null || (data['supplier_name'] as String).isEmpty) {
+      errors['supplier_name'] = 'Supplier name is required';
+    }
+    
+    if (data['contact_email'] != null && (data['contact_email'] as String).isNotEmpty) {
+      final emailRegex = RegExp(r'^[\w-\.]+@([\w-]+\.)+[\w-]{2,4}$');
+      if (!emailRegex.hasMatch(data['contact_email'])) {
+        errors['contact_email'] = 'Invalid email format';
+      }
+    }
+    
+    if (data['contact_phone'] != null && (data['contact_phone'] as String).isNotEmpty) {
+      final phoneRegex = RegExp(r'^\+?[0-9]{10,15}$');
+      if (!phoneRegex.hasMatch(data['contact_phone'])) {
+        errors['contact_phone'] = 'Invalid phone number format';
+      }
+    }
+    
+    return errors;
+  }
+  
+  // Purchase Order validation
+  Map<String, String> validatePurchaseOrder(Map<String, dynamic> data, List<Map<String, dynamic>> lineItems) {
+    final errors = <String, String>{};
+    
+    if (data['supplier_id'] == null || (data['supplier_id'] as String).isEmpty) {
+      errors['supplier_id'] = 'Supplier is required';
+    }
+    
+    if (data['po_date'] == null) {
+      errors['po_date'] = 'PO date is required';
+    }
+    
+    if (data['delivery_date'] != null) {
+      final poDate = (data['po_date'] as Timestamp).toDate();
+      final deliveryDate = (data['delivery_date'] as Timestamp).toDate();
+      
+      if (deliveryDate.isBefore(poDate)) {
+        errors['delivery_date'] = 'Delivery date cannot be before PO date';
+      }
+    }
+    
+    if (lineItems.isEmpty) {
+      errors['line_items'] = 'At least one line item is required';
+    }
+    
+    for (int i = 0; i < lineItems.length; i++) {
+      final item = lineItems[i];
+      
+      if (item['product_id'] == null || (item['product_id'] as String).isEmpty) {
+        errors['line_item_${i}_product'] = 'Product is required';
+      }
+      
+      final quantity = item['quantity'] ?? 0;
+      if (quantity <= 0) {
+        errors['line_item_${i}_quantity'] = 'Quantity must be greater than zero';
+      }
+      
+      final unitPrice = item['unit_price'] ?? 0.0;
+      if (unitPrice < 0) {
+        errors['line_item_${i}_unit_price'] = 'Unit price cannot be negative';
+      }
+    }
+    
+    return errors;
+  }
+  
+  // Customer Order validation
+  Map<String, String> validateCustomerOrder(Map<String, dynamic> data, List<Map<String, dynamic>> lineItems) {
+    final errors = <String, String>{};
+    
+    if (data['customer_id'] == null || (data['customer_id'] as String).isEmpty) {
+      errors['customer_id'] = 'Customer is required';
+    }
+    
+    if (data['order_date'] == null) {
+      errors['order_date'] = 'Order date is required';
+    }
+    
+    if (lineItems.isEmpty) {
+      errors['line_items'] = 'At least one line item is required';
+    }
+    
+    for (int i = 0; i < lineItems.length; i++) {
+      final item = lineItems[i];
+      
+      if (item['product_id'] == null || (item['product_id'] as String).isEmpty) {
+        errors['line_item_${i}_product'] = 'Product is required';
+      }
+      
+      final quantity = item['quantity'] ?? 0;
+      if (quantity <= 0) {
+        errors['line_item_${i}_quantity'] = 'Quantity must be greater than zero';
+      }
+    }
+    
+    return errors;
+  }
+  
+  // Customer Profile validation
+  Map<String, String> validateCustomerProfile(Map<String, dynamic> data) {
+    final errors = <String, String>{};
+    
+    if (data['customer_name'] == null || (data['customer_name'] as String).isEmpty) {
+      errors['customer_name'] = 'Customer name is required';
+    }
+    
+    if (data['email'] != null && (data['email'] as String).isNotEmpty) {
+      final emailRegex = RegExp(r'^[\w-\.]+@([\w-]+\.)+[\w-]{2,4}$');
+      if (!emailRegex.hasMatch(data['email'])) {
+        errors['email'] = 'Invalid email format';
+      }
+    }
+    
+    if (data['phone'] != null && (data['phone'] as String).isNotEmpty) {
+      final phoneRegex = RegExp(r'^\+?[0-9]{10,15}$');
+      if (!phoneRegex.hasMatch(data['phone'])) {
+        errors['phone'] = 'Invalid phone number format';
+      }
+    }
+    
+    return errors;
+  }
+  
+  // User Profile validation
+  Map<String, String> validateUserProfile(Map<String, dynamic> data) {
+    final errors = <String, String>{};
+    
+    if (data['display_name'] == null || (data['display_name'] as String).isEmpty) {
+      errors['display_name'] = 'Display name is required';
+    }
+    
+    if (data['email'] == null || (data['email'] as String).isEmpty) {
+      errors['email'] = 'Email is required';
+    } else {
+      final emailRegex = RegExp(r'^[\w-\.]+@([\w-]+\.)+[\w-]{2,4}$');
+      if (!emailRegex.hasMatch(data['email'])) {
+        errors['email'] = 'Invalid email format';
+      }
+    }
+    
+    if (data['role'] == null || (data['role'] as String).isEmpty) {
+      errors['role'] = 'Role is required';
+    }
+    
+    return errors;
+  }
+  
+  // Validate data against business rules
+  void validateData(String entityType, Map<String, dynamic> data, {List<Map<String, dynamic>>? lineItems}) {
+    Map<String, String> errors;
+    
+    switch (entityType) {
+      case 'product':
+        errors = validateProduct(data);
+        break;
+      case 'inventory':
+        errors = validateInventory(data);
+        break;
+      case 'supplier':
+        errors = validateSupplier(data);
+        break;
+      case 'purchase_order':
+        errors = validatePurchaseOrder(data, lineItems ?? []);
+        break;
+      case 'customer_order':
+        errors = validateCustomerOrder(data, lineItems ?? []);
+        break;
+      case 'customer_profile':
+        errors = validateCustomerProfile(data);
+        break;
+      case 'user_profile':
+        errors = validateUserProfile(data);
+        break;
+      default:
+        errors = {};
+    }
+    
+    if (errors.isNotEmpty) {
+      throw ValidationException(
+        'Validation failed for $entityType',
+        fieldErrors: errors,
+        module: entityType,
+      );
+    }
+  }
+}
+
+// ==================== CACHE SERVICE ====================
+
+/// Cache entry with expiration
+class CacheEntry<T> {
+  final T value;
+  final DateTime expiresAt;
+  
+  CacheEntry({
+    required this.value,
+    required Duration expiry,
+  }) : expiresAt = DateTime.now().add(expiry);
+  
+  bool get isExpired => DateTime.now().isAfter(expiresAt);
+}
+
+/// Cache service for improved performance
+class CacheService {
+  final Map<String, CacheEntry<dynamic>> _cache = {};
+  final Duration _defaultExpiry;
+  final int _maxItems;
+  
+  CacheService({
+    Duration defaultExpiry = const Duration(minutes: 15),
+    int maxItems = 100,
+  }) : 
+    _defaultExpiry = defaultExpiry,
+    _maxItems = maxItems;
+  
+  T? get<T>(String key) {
+    final entry = _cache[key];
+    if (entry == null) return null;
+    
+    if (entry.isExpired) {
+      _cache.remove(key);
+      return null;
+    }
+    
+    return entry.value as T;
+  }
+  
+  void set<T>(String key, T value, {Duration? expiry}) {
+    // Enforce max items limit
+    if (_cache.length >= _maxItems && !_cache.containsKey(key)) {
+      // Remove oldest entry
+      final oldestKey = _cache.entries
+          .reduce((a, b) => a.value.expiresAt.isBefore(b.value.expiresAt) ? a : b)
+          .key;
+      _cache.remove(oldestKey);
+    }
+    
+    _cache[key] = CacheEntry<T>(
+      value: value,
+      expiry: expiry ?? _defaultExpiry,
+    );
+  }
+  
+  void remove(String key) {
+    _cache.remove(key);
+  }
+  
+  void clear() {
+    _cache.clear();
+  }
+  
+  void clearExpired() {
+    _cache.removeWhere((_, entry) => entry.isExpired);
+  }
+}
+
+// ==================== BASE SERVICE ====================
+
+/// Base service with common CRUD operations
+abstract class BaseService<T> {
+  final FirebaseFirestore _firestore;
+  final AuditService _auditService;
+  final ValidationService _validationService;
+  final CacheService _cacheService;
+  
+  final String collectionPath;
+  final String entityType;
+  final String module;
+  
+  BaseService({
+    required this.collectionPath,
+    required this.entityType,
+    required this.module,
+    FirebaseFirestore? firestore,
+    AuditService? auditService,
+    ValidationService? validationService,
+    CacheService? cacheService,
+  }) : 
+    _firestore = firestore ?? FirebaseFirestore.instance,
+    _auditService = auditService ?? AuditService(),
+    _validationService = validationService ?? ValidationService(),
+    _cacheService = cacheService ?? CacheService();
+  
+  // Abstract methods to be implemented by subclasses
+  T fromFirestore(DocumentSnapshot doc);
+  Map<String, dynamic> toFirestore(T item);
+  String getItemId(T item);
+  
+  /// Get a collection reference
+  CollectionReference<Map<String, dynamic>> collection() {
+    return _firestore.collection(collectionPath);
+  }
+  
+  /// Get a document reference
+  DocumentReference<Map<String, dynamic>> document(String id) {
+    return collection().doc(id);
+  }
+  
+  /// Get all items
+  Stream<List<T>> getAll({
+    String? orderBy,
+    bool descending = false,
+    int? limit,
+    Map<String, dynamic>? filters,
+  }) {
+    try {
+      Query<Map<String, dynamic>> query = collection();
+      
+      // Apply filters if provided
+      if (filters != null) {
+        filters.forEach((field, value) {
+          if (value is List && value.length == 2) {
+            // Assume [operator, value] format
+            query = query.where(field, isEqualTo: value[1]);
+          } else {
+            query = query.where(field, isEqualTo: value);
+          }
+        });
+      }
+      
+      // Apply ordering if provided
+      if (orderBy != null) {
+        query = query.orderBy(orderBy, descending: descending);
+      }
+      
+      // Apply limit if provided
+      if (limit != null) {
+        query = query.limit(limit);
+      }
+      
+      return query.snapshots().map((snapshot) {
+        return snapshot.docs.map((doc) => fromFirestore(doc)).toList();
+      });
+    } catch (e) {
+      ServiceErrorHandler.handleError(
+        e, 
+      // Handle any error, log it, and return null so callers can deal gracefully
+      ServiceErrorHandler.handleError(
+        operation: 'getAll',
+        module: module,
+        operation: 'getCurrentUserProfile',
+      );
+      return null;
+    }
+  }
+}
+  Future<T?> getById(String id) async {
+    try {
+      // Check cache first
+      final cachedItem = _cacheService.get<T>('$entityType:$id');
+      if (cachedItem != null) {
+        return cachedItem;
+      }
+      
+      final docSnapshot = await document(id).get();
+      
+      if (!docSnapshot.exists) {
+        return null;
+      }
+      
+      final item = fromFirestore(docSnapshot);
+      
+      // Cache the result
+      _cacheService.set('$entityType:$id', item);
+      
+      return item;
+    } catch (e) {
+      ServiceErrorHandler.handleError(
+        e, 
+        module: module, 
+        operation: 'getById',
+        data: {'id': id},
+      );
+      return null;
+    }
+  }
+  
+  /// Stream an item by ID
+  Stream<T?> streamById(String id) {
+    try {
+      return document(id).snapshots().map((docSnapshot) {
+        if (!docSnapshot.exists) {
+          return null;
+        }
+        
+        final item = fromFirestore(docSnapshot);
+        
+        // Cache the result
+        _cacheService.set('$entityType:$id', item);
+        
+        return item;
+      });
+    } catch (e) {
+      ServiceErrorHandler.handleError(
+        e, 
+        module: module, 
+        operation: 'streamById',
+        data: {'id': id},
+      );
+      return Stream.value(null);
+    }
+  }
+  
+  /// Create a new item
+  Future<T> create(T item) async {
+    try {
+      final data = toFirestore(item);
+      
+      // Validate data
+      _validationService.validateData(entityType, data);
+      
+      // Set metadata
+      final currentUser = FirebaseAuth.instance.currentUser;
+      final now = FieldValue.serverTimestamp();
+      
+      data['created_at'] = now;
+      data['updated_at'] = now;
+      data['created_by'] = currentUser?.uid;
+      data['updated_by'] = currentUser?.uid;
+      
+      // Get ID from item or generate a new one
+      final id = getItemId(item);
+      final docRef = id.isEmpty ? collection().doc() : document(id);
+      
+      // If ID was empty, update the data with the new ID
+      if (id.isEmpty && data.containsKey('${entityType}_id')) {
+        data['${entityType}_id'] = docRef.id;
+      }
+      
+      // Create the document
+      await docRef.set(data);
+      
+      // Get the created item
+      final docSnapshot = await docRef.get();
+      final createdItem = fromFirestore(docSnapshot);
+      
+      // Log audit trail
+      await _auditService.logActivity(
+        module: module,
+        action: 'create',
+        entityType: entityType,
+        entityId: docRef.id,
+        after: data,
+        notes: 'Created new $entityType',
+      );
+      
+      // Cache the result
+      _cacheService.set('$entityType:${docRef.id}', createdItem);
+      
+      return createdItem;
+    } catch (e) {
+      ServiceErrorHandler.handleError(
+        e, 
+        module: module, 
+        operation: 'create',
+        data: toFirestore(item),
+      );
+      rethrow;
+    }
+  }
+  
+  /// Update an existing item
+  Future<T> update(String id, T item) async {
+    try {
+      final data = toFirestore(item);
+      
+      // Validate data
+      _validationService.validateData(entityType, data);
+      
+      // Get the current data for audit trail
+      final docRef = document(id);
+      final currentDoc = await docRef.get();
+      final before = currentDoc.data();
+      
+      // Set metadata
+      final currentUser = FirebaseAuth.instance.currentUser;
+      final now = FieldValue.serverTimestamp();
+      
+      data['updated_at'] = now;
+      data['updated_by'] = currentUser?.uid;
+      
+      // Update the document
+      await docRef.update(data);
+      
+      // Get the updated item
+      final docSnapshot = await docRef.get();
+      final updatedItem = fromFirestore(docSnapshot);
+      
+      // Log audit trail
+      await _auditService.logActivity(
+        module: module,
+        action: 'update',
+        entityType: entityType,
+        entityId: id,
+        before: before,
+        after: data,
+        notes: 'Updated $entityType',
+      );
+      
+      // Update cache
+      _cacheService.set('$entityType:$id', updatedItem);
+      
+      return updatedItem;
+    } catch (e) {
+      ServiceErrorHandler.handleError(
+        e, 
+        module: module, 
+        operation: 'update',
+        data: {'id': id, 'data': toFirestore(item)},
+      );
+      rethrow;
+    }
+  }
+  
+  /// Delete an item (soft delete)
+  Future<void> delete(String id) async {
+    try {
+      // Get the current data for audit trail
+      final docRef = document(id);
+      final currentDoc = await docRef.get();
+      final before = currentDoc.data();
+      
+      // Set metadata for soft delete
+      final currentUser = FirebaseAuth.instance.currentUser;
+      final now = FieldValue.serverTimestamp();
+      
+      // Soft delete by setting deleted_at
+      await docRef.update({
+        'deleted_at': now,
+        'updated_at': now,
+        'updated_by': currentUser?.uid,
+      });
+      
+      // Log audit trail
+      await _auditService.logActivity(
+        module: module,
+        action: 'delete',
+        entityType: entityType,
+        entityId: id,
+        before: before,
+        notes: 'Deleted $entityType',
+      );
+      
+      // Remove from cache
+      _cacheService.remove('$entityType:$id');
+    } catch (e) {
+      ServiceErrorHandler.handleError(
+        e, 
+        module: module, 
+        operation: 'delete',
+        data: {'id': id},
+      );
+      rethrow;
+    }
+  }
+  
+  /// Hard delete an item (permanent deletion)
+  Future<void> hardDelete(String id) async {
+    try {
+      // Get the current data for audit trail
+      final docRef = document(id);
+      final currentDoc = await docRef.get();
+      final before = currentDoc.data();
+      
+      // Hard delete
+      await docRef.delete();
+      
+      // Log audit trail
+      await _auditService.logActivity(
+        module: module,
+        action: 'hard_delete',
+        entityType: entityType,
+        entityId: id,
+        before: before,
+        notes: 'Permanently deleted $entityType',
+      );
+      
+      // Remove from cache
+      _cacheService.remove('$entityType:$id');
+    } catch (e) {
+      ServiceErrorHandler.handleError(
+        e, 
+        module: module, 
+        operation: 'hardDelete',
+        data: {'id': id},
+      );
+      rethrow;
+    }
+  }
+  
+  /// Batch create multiple items
+  Future<List<T>> batchCreate(List<T> items) async {
+    try {
+      final batch = _firestore.batch();
+      final createdItems = <T>[];
+      final currentUser = FirebaseAuth.instance.currentUser;
+      final now = Timestamp.now();
+      
+      for (final item in items) {
+        final data = toFirestore(item);
+        
+        // Validate data
+        _validationService.validateData(entityType, data);
+        
+        // Set metadata
+        data['created_at'] = now;
+        data['updated_at'] = now;
+        data['created_by'] = currentUser?.uid;
+        data['updated_by'] = currentUser?.uid;
+        
+        // Get ID from item or generate a new one
+        final id = getItemId(item);
+        final docRef = id.isEmpty ? collection().doc() : document(id);
+        
+        // If ID was empty, update the data with the new ID
+        if (id.isEmpty && data.containsKey('${entityType}_id')) {
+          data['${entityType}_id'] = docRef.id;
+        }
+        
+        // Add to batch
+        batch.set(docRef, data);
+        
+        // Get the document reference for later retrieval
+        createdItems.add(item);
+      }
+      
+      // Commit the batch
+      await batch.commit();
+      
+      // Log audit trail
+      await _auditService.logActivity(
+        module: module,
+        action: 'batch_create',
+        entityType: entityType,
+        entityId: 'batch',
+        notes: 'Created ${items.length} $entityType items in batch',
+      );
+      
+      // Return the created items
+      return createdItems;
+    } catch (e) {
+      ServiceErrorHandler.handleError(
+        e, 
+        module: module, 
+        operation: 'batchCreate',
+        data: {'count': items.length},
+      );
+      rethrow;
+    }
+  }
+  
+  /// Batch update multiple items
+  Future<void> batchUpdate(Map<String, T> items) async {
+    try {
+      final batch = _firestore.batch();
+      final currentUser = FirebaseAuth.instance.currentUser;
+      final now = Timestamp.now();
+      
+      for (final entry in items.entries) {
+        final id = entry.key;
+        final item = entry.value;
+        final data = toFirestore(item);
+        
+        // Validate data
+        _validationService.validateData(entityType, data);
+        
+        // Set metadata
+        data['updated_at'] = now;
+        data['updated_by'] = currentUser?.uid;
+        
+        // Add to batch
+        batch.update(document(id), data);
+      }
+      
+      // Commit the batch
+      await batch.commit();
+      
+      // Log audit trail
+      await _auditService.logActivity(
+        module: module,
+        action: 'batch_update',
+        entityType: entityType,
+        entityId: 'batch',
+        notes: 'Updated ${items.length} $entityType items in batch',
+      );
+      
+      // Clear cache for updated items
+      items.keys.forEach((id) {
+        _cacheService.remove('$entityType:$id');
+      });
+    } catch (e) {
+      ServiceErrorHandler.handleError(
+        e, 
+        module: module, 
+        operation: 'batchUpdate',
+        data: {'count': items.length},
+      );
+      rethrow;
+    }
+  }
+  
+  /// Batch delete multiple items (soft delete)
+  Future<void> batchDelete(List<String> ids) async {
+    try {
+      final batch = _firestore.batch();
+      final currentUser = FirebaseAuth.instance.currentUser;
+      final now = Timestamp.now();
+      
+      for (final id in ids) {
+        // Soft delete by setting deleted_at
+        batch.update(document(id), {
+          'deleted_at': now,
+          'updated_at': now,
+          'updated_by': currentUser?.uid,
+        });
+      }
+      
+      // Commit the batch
+      await batch.commit();
+      
+      // Log audit trail
+      await _auditService.logActivity(
+        module: module,
+        action: 'batch_delete',
+        entityType: entityType,
+        entityId: 'batch',
+        notes: 'Deleted ${ids.length} $entityType items in batch',
+      );
+      
+      // Clear cache for deleted items
+      ids.forEach((id) {
+        _cacheService.remove('$entityType:$id');
+      });
+    } catch (e) {
+      ServiceErrorHandler.handleError(
+        e, 
+        module: module, 
+        operation: 'batchDelete',
+        data: {'count': ids.length},
+      );
+      rethrow;
+    }
+  }
+  
+  /// Search items by field
+  Future<List<T>> searchByField(String field, String value) async {
+    try {
+      final snapshot = await collection()
+          .where(field, isGreaterThanOrEqualTo: value)
+          .where(field, isLessThanOrEqualTo: value + '\uf8ff')
+          .get();
+          
+      return snapshot.docs.map((doc) => fromFirestore(doc)).toList();
+    } catch (e) {
+      ServiceErrorHandler.handleError(
+        e, 
+        module: module, 
+        operation: 'searchByField',
+        data: {'field': field, 'value': value},
+      );
+      return [];
+    }
+  }
+}
+
+// ==================== MODULE-SPECIFIC SERVICES ====================
+
+/// Product service
+class ProductService extends BaseService<Product> {
+  ProductService({
+    FirebaseFirestore? firestore,
+    AuditService? auditService,
+    ValidationService? validationService,
+    CacheService? cacheService,
+  }) : super(
+    collectionPath: 'products',
+    entityType: 'product',
+    module: 'product_management',
+    firestore: firestore,
+    auditService: auditService,
+    validationService: validationService,
+    cacheService: cacheService,
+  );
+  
+  @override
+  Product fromFirestore(DocumentSnapshot doc) {
+    return Product.fromFirestore(doc);
+  }
+  
+  @override
+  Map<String, dynamic> toFirestore(Product item) {
+    return item.toMap();
+  }
+  
+  @override
+  String getItemId(Product item) {
+    return item.productId;
+  }
+  
+  /// Get products by category
+  Stream<List<Product>> getByCategory(String category) {
+    return getAll(filters: {'category': category});
+  }
+  
+  /// Get products by supplier
+  Stream<List<Product>> getBySupplier(String supplierId) {
+    return getAll(filters: {'default_supplier_ref': supplierId});
+  }
+  
+  /// Search products by name
+  Future<List<Product>> searchByName(String query) {
+    return searchByField('product_name', query);
+  }
+  
+  /// Search products by SKU
+  Future<List<Product>> searchBySku(String query) {
+    return searchByField('sku', query);
+  }
+  
+  /// Generate a product slug from name
+  String generateSlug(String productName) {
+    return productName
+        .toLowerCase()
+        .replaceAll(RegExp(r'[^a-z0-9\s-]'), '')
+        .replaceAll(RegExp(r'\s+'), '-');
+  }
+  
+  /// Check if SKU exists
+  Future<bool> skuExists(String sku) async {
+    final snapshot = await collection()
+        .where('sku', isEqualTo: sku)
+        .limit(1)
+        .get();
+        
+    return snapshot.docs.isNotEmpty;
+  }
+}
+
+/// Inventory service
+class InventoryService extends BaseService<InventoryItem> {
+  final ProductService _productService;
+  
+  InventoryService({
+    FirebaseFirestore? firestore,
+    AuditService? auditService,
+    ValidationService? validationService,
+    CacheService? cacheService,
+    ProductService? productService,
+  }) : 
+    _productService = productService ?? ProductService(),
+    super(
+      collectionPath: 'inventory',
+      entityType: 'inventory',
+      module: 'inventory_management',
+      firestore: firestore,
+      auditService: auditService,
+      validationService: validationService,
+      cacheService: cacheService,
+    );
+  
+  @override
+  InventoryItem fromFirestore(DocumentSnapshot doc) {
+    return InventoryItem.fromFirestore(doc);
+  }
+  
+  @override
+  Map<String, dynamic> toFirestore(InventoryItem item) {
+    return item.toMap();
+  }
+  
+  @override
+  String getItemId(InventoryItem item) {
+    return item.inventoryId;
+  }
+  
+  /// Get inventory by product
+  Stream<List<InventoryItem>> getByProduct(String productId) {
+    return getAll(filters: {'product_id': productId});
+  }
+  
+  /// Get inventory by warehouse
+  Stream<List<InventoryItem>> getByWarehouse(String warehouseId) {
+    return getAll(filters: {'warehouse_id': warehouseId});
+  }
+  
+  /// Get low stock items
+  Stream<List<InventoryItem>> getLowStockItems() {
+    return collection()
+        .where('current_stock', isLessThanOrEqualTo: 'min_stock_level')
+        .snapshots()
+        .map((snapshot) {
+          return snapshot.docs.map((doc) => fromFirestore(doc)).toList();
+        });
+  }
+  
+  /// Update stock level
+  Future<InventoryItem> updateStock(String inventoryId, int quantity, String reason) async {
+    try {
+      final docRef = document(inventoryId);
+      final inventoryDoc = await docRef.get();
+      
+      if (!inventoryDoc.exists) {
+        throw BusinessException('Inventory item not found', module: module);
+      }
+      
+      final currentStock = inventoryDoc.data()?['current_stock'] ?? 0;
+      final newStock = currentStock + quantity;
+      
+      if (newStock < 0) {
+        throw BusinessException('Cannot reduce stock below zero', module: module);
+      }
+      
+      // Update the stock
+      await docRef.update({
+        'current_stock': newStock,
+        'updated_at': FieldValue.serverTimestamp(),
+        'updated_by': FirebaseAuth.instance.currentUser?.uid,
+      });
+      
+      // Log the stock movement
+      await FirebaseFirestore.instance.collection('stock_movements').add({
+        'inventory_id': inventoryId,
+        'product_id': inventoryDoc.data()?['product_id'],
+        'warehouse_id': inventoryDoc.data()?['warehouse_id'],
+        'quantity': quantity,
+        'previous_stock': currentStock,
+        'new_stock': newStock,
+        'reason': reason,
+        'timestamp': FieldValue.serverTimestamp(),
+        'user_id': FirebaseAuth.instance.currentUser?.uid,
+      });
+      
+      // Log audit trail
+      await _auditService.logActivity(
+        module: module,
+        action: 'update_stock',
+        entityType: entityType,
+        entityId: inventoryId,
+        before: {'current_stock': currentStock},
+        after: {'current_stock': newStock},
+        notes: 'Updated stock: $quantity ($reason)',
+      );
+      
+      // Get the updated inventory item
+      final updatedDoc = await docRef.get();
+      final updatedItem = fromFirestore(updatedDoc);
+      
+      // Update cache
+      _cacheService.set('$entityType:$inventoryId', updatedItem);
+      
+      return updatedItem;
+    } catch (e) {
+      ServiceErrorHandler.handleError(
+        e, 
+        module: module, 
+        operation: 'updateStock',
+        data: {'inventoryId': inventoryId, 'quantity': quantity, 'reason': reason},
+      );
+      rethrow;
+    }
+  }
+  
+  /// Get stock movement history
+  Stream<QuerySnapshot> getStockMovements(String inventoryId) {
+    return FirebaseFirestore.instance
+        .collection('stock_movements')
+        .where('inventory_id', isEqualTo: inventoryId)
+        .orderBy('timestamp', descending: true)
+        .snapshots();
+  }
+  
+  /// Check if product has sufficient stock
+  Future<bool> hasSufficientStock(String productId, int requiredQuantity) async {
+    try {
+      final snapshot = await FirebaseFirestore.instance
+          .collection('inventory')
+          .where('product_id', isEqualTo: productId)
+          .get();
+          
+      int totalStock = 0;
+      for (final doc in snapshot.docs) {
+        totalStock += (doc.data()['current_stock'] ?? 0) as int;
+      }
+      
+      return totalStock >= requiredQuantity;
+    } catch (e) {
+      ServiceErrorHandler.handleError(
+        e, 
+        module: module, 
+        operation: 'hasSufficientStock',
+        data: {'productId': productId, 'requiredQuantity': requiredQuantity},
+      );
+      return false;
+    }
+  }
+}
+
+/// Supplier service
+class SupplierService extends BaseService<Supplier> {
+  SupplierService({
+    FirebaseFirestore? firestore,
+    AuditService? auditService,
+    ValidationService? validationService,
+    CacheService? cacheService,
+  }) : super(
+    collectionPath: 'suppliers',
+    entityType: 'supplier',
+    module: 'supplier_management',
+    firestore: firestore,
+    auditService: auditService,
+    validationService: validationService,
+    cacheService: cacheService,
+  );
+  
+  @override
+  Supplier fromFirestore(DocumentSnapshot doc) {
+    return Supplier.fromFirestore(doc);
+  }
+  
+  @override
+  Map<String, dynamic> toFirestore(Supplier item) {
+    return item.toMap();
+  }
+  
+  @override
+  String getItemId(Supplier item) {
+    return item.supplierId;
+  }
+  
+  /// Get suppliers by category
+  Stream<List<Supplier>> getByCategory(String category) {
+    return getAll(filters: {'category': category});
+  }
+  
+  /// Search suppliers by name
+  Future<List<Supplier>> searchByName(String query) {
+    return searchByField('supplier_name', query);
+  }
+  
+  /// Update supplier rating
+  Future<Supplier> updateRating(String supplierId, double rating, String notes) async {
+    try {
+      final docRef = document(supplierId);
+      final supplierDoc = await docRef.get();
+      
+      if (!supplierDoc.exists) {
+        throw BusinessException('Supplier not found', module: module);
+      }
+      
+      final currentRating = supplierDoc.data()?['rating'] ?? 0.0;
+      final currentRatingCount = supplierDoc.data()?['rating_count'] ?? 0;
+      
+      // Calculate new average rating
+      final newRatingCount = currentRatingCount + 1;
+      final newRating = ((currentRating * currentRatingCount) + rating) / newRatingCount;
+      
+      // Update the supplier
+      await docRef.update({
+        'rating': newRating,
+        'rating_count': newRatingCount,
+        'updated_at': FieldValue.serverTimestamp(),
+        'updated_by': FirebaseAuth.instance.currentUser?.uid,
+      });
+      
+      // Log the rating
+      await FirebaseFirestore.instance.collection('supplier_ratings').add({
+        'supplier_id': supplierId,
+        'rating': rating,
+        'notes': notes,
+        'timestamp': FieldValue.serverTimestamp(),
+        'user_id': FirebaseAuth.instance.currentUser?.uid,
+      });
+      
+      // Log audit trail
+      await _auditService.logActivity(
+        module: module,
+        action: 'update_rating',
+        entityType: entityType,
+        entityId: supplierId,
+        before: {'rating': currentRating, 'rating_count': currentRatingCount},
+        after: {'rating': newRating, 'rating_count': newRatingCount},
+        notes: 'Updated supplier rating: $rating',
+      );
+      
+      // Get the updated supplier
+      final updatedDoc = await docRef.get();
+      final updatedItem = fromFirestore(updatedDoc);
+      
+      // Update cache
+      _cacheService.set('$entityType:$supplierId', updatedItem);
+      
+      return updatedItem;
+    } catch (e) {
+      ServiceErrorHandler.handleError(
+        e, 
+        module: module, 
+        operation: 'updateRating',
+        data: {'supplierId': supplierId, 'rating': rating},
+      );
+      rethrow;
+    }
+  }
+  
+  /// Get supplier rating history
+  Stream<QuerySnapshot> getRatingHistory(String supplierId) {
+    return FirebaseFirestore.instance
+        .collection('supplier_ratings')
+        .where('supplier_id', isEqualTo: supplierId)
+        .orderBy('timestamp', descending: true)
+        .snapshots();
+  }
+}
+
+/// Purchase Order service
+class PurchaseOrderService extends BaseService<PurchaseOrder> {
+  final SupplierService _supplierService;
+  final ProductService _productService;
+  final InventoryService _inventoryService;
+  
+  PurchaseOrderService({
+    FirebaseFirestore? firestore,
+    AuditService? auditService,
+    ValidationService? validationService,
+    CacheService? cacheService,
+    SupplierService? supplierService,
+    ProductService? productService,
+    InventoryService? inventoryService,
+  }) : 
+    _supplierService = supplierService ?? SupplierService(),
+    _productService = productService ?? ProductService(),
+    _inventoryService = inventoryService ?? InventoryService(),
+    super(
+      collectionPath: 'purchase_orders',
+      entityType: 'purchase_order',
+      module: 'purchase_order_management',
+      firestore: firestore,
+      auditService: auditService,
+      validationService: validationService,
+      cacheService: cacheService,
+    );
+  
+  @override
+  PurchaseOrder fromFirestore(DocumentSnapshot doc) {
+    return PurchaseOrder.fromFirestore(doc);
+  }
+  
+  @override
+  Map<String, dynamic> toFirestore(PurchaseOrder item) {
+    return item.toMap();
+  }
+  
+  @override
+  String getItemId(PurchaseOrder item) {
+    return item.poId;
+  }
+  
+  /// Get POs by supplier
+  Stream<List<PurchaseOrder>> getBySupplier(String supplierId) {
+    return getAll(filters: {'supplier_id': supplierId});
+  }
+  
+  /// Get POs by status
+  Stream<List<PurchaseOrder>> getByStatus(String status) {
+    return getAll(filters: {'po_status': status});
+  }
+  
+  /// Create PO with line items
+  Future<PurchaseOrder> createWithLineItems(
+    PurchaseOrder po, 
+    List<PoLineItem> lineItems
+  ) async {
+    try {
+      // Start a transaction
+      return await FirebaseFirestore.instance.runTransaction<PurchaseOrder>((transaction) async {
+        // First, validate the PO and line items
+        final poData = toFirestore(po);
+        final lineItemsData = lineItems.map((item) => item.toMap()).toList();
+        
+        _validationService.validateData(
+          'purchase_order', 
+          poData, 
+          lineItems: lineItemsData,
+        );
+        
+        // Set metadata
+        final currentUser = FirebaseAuth.instance.currentUser;
+        final now = Timestamp.now();
+        
+        poData['created_at'] = now;
+        poData['updated_at'] = now;
+        poData['created_by'] = currentUser?.uid;
+        poData['updated_by'] = currentUser?.uid;
+        
+        // Generate PO number if not provided
+        if (po.poNumber.isEmpty) {
+          final timestamp = DateTime.now().millisecondsSinceEpoch;
+          poData['po_number'] = 'PO-${timestamp.toString().substring(timestamp.toString().length - 6)}';
+        }
+        
+        // Get ID from PO or generate a new one
+        final poId = po.poId.isEmpty ? const Uuid().v4() : po.poId;
+        final poRef = document(poId);
+        
+        if (po.poId.isEmpty) {
+          poData['po_id'] = poId;
+        }
+        
+        // Calculate total amount from line items
+        double totalAmount = 0;
+        for (final lineItem in lineItems) {
+          totalAmount += (lineItem.unitPrice * lineItem.quantity);
+        }
+        
+        // Update PO with calculated total
+        poData['total_amount'] = totalAmount;
+        
+        // Create the PO
+        transaction.set(poRef, poData);
+        
+        // Create line items
+        for (int i = 0; i < lineItems.length; i++) {
+          final lineItem = lineItems[i];
+          final lineItemData = lineItem.toMap();
+          
+          // Set metadata
+          lineItemData['created_at'] = now;
+          lineItemData['updated_at'] = now;
+          lineItemData['created_by'] = currentUser?.uid;
+          lineItemData['updated_by'] = currentUser?.uid;
+          
+          // Set PO ID
+          lineItemData['po_id'] = poId;
+          
+          // Generate line item ID if not provided
+          final lineItemId = lineItem.lineItemId.isEmpty ? const Uuid().v4() : lineItem.lineItemId;
+          final lineItemRef = FirebaseFirestore.instance.collection('po_line_items').doc(lineItemId);
+          
+          if (lineItem.lineItemId.isEmpty) {
+            lineItemData['line_item_id'] = lineItemId;
+          }
+          
+          // Create the line item
+          transaction.set(lineItemRef, lineItemData);
+        }
+        
+        // Return the created PO with updated data
+        return PurchaseOrder(
+          poId: poId,
+          poNumber: poData['po_number'],
+          supplierId: po.supplierId,
+          poDate: po.poDate,
+          deliveryDate: po.deliveryDate,
+          poStatus: po.poStatus,
+          totalAmount: totalAmount,
+          notes: po.notes,
+          paymentTerms: po.paymentTerms,
+          shippingTerms: po.shippingTerms,
+          createdAt: now,
+          updatedAt: now,
+          createdBy: currentUser?.uid,
+          updatedBy: currentUser?.uid,
+        );
+      });
+    } catch (e) {
+      ServiceErrorHandler.handleError(
+        e, 
+        module: module, 
+        operation: 'createWithLineItems',
+        data: {'po': toFirestore(po), 'lineItemsCount': lineItems.length},
+      );
+      rethrow;
+    }
+  }
+  
+  /// Get line items for a PO
+  Stream<List<PoLineItem>> getLineItems(String poId) {
+    try {
+      return FirebaseFirestore.instance
+          .collection('po_line_items')
+          .where('po_id', isEqualTo: poId)
+          .snapshots()
+          .map((snapshot) {
+            return snapshot.docs.map((doc) {
+              return PoLineItem.fromFirestore(doc);
+            }).toList();
+          });
+    } catch (e) {
+      ServiceErrorHandler.handleError(
+        e, 
+        module: module, 
+        operation: 'getLineItems',
+        data: {'poId': poId},
+      );
+      return Stream.value([]);
+    }
+  }
+  
+  /// Update PO status
+  Future<PurchaseOrder> updateStatus(String poId, String newStatus, {String? notes}) async {
+    try {
+      final docRef = document(poId);
+      final poDoc = await docRef.get();
+      
+      if (!poDoc.exists) {
+        throw BusinessException('Purchase order not found', module: module);
+      }
+      
+      final currentStatus = poDoc.data()?['po_status'];
+      final currentUser = FirebaseAuth.instance.currentUser;
+      final now = FieldValue.serverTimestamp();
+      
+      // Validate status transition
+      _validateStatusTransition(currentStatus, newStatus);
+      
+      // Update the PO
+      await docRef.update({
+        'po_status': newStatus,
+        'updated_at': now,
+        'updated_by': currentUser?.uid,
+      });
+      
+      // Log status change
+      await FirebaseFirestore.instance.collection('po_status_history').add({
+        'po_id': poId,
+        'previous_status': currentStatus,
+        'new_status': newStatus,
+        'notes': notes,
+        'timestamp': now,
+        'user_id': currentUser?.uid,
+      });
+      
+      // If status is 'received', update inventory
+      if (newStatus == 'received') {
+        await _receiveInventory(poId);
+      }
+      
+      // Log audit trail
+      await _auditService.logActivity(
+        module: module,
+        action: 'update_status',
+        entityType: entityType,
+        entityId: poId,
+        before: {'po_status': currentStatus},
+        after: {'po_status': newStatus},
+        notes: 'Updated PO status: $currentStatus -> $newStatus${notes != null ? " ($notes)" : ""}',
+      );
+      
+      // Get the updated PO
+      final updatedDoc = await docRef.get();
+      final updatedPo = fromFirestore(updatedDoc);
+      
+      // Update cache
+      _cacheService.set('$entityType:$poId', updatedPo);
+      
+      return updatedPo;
+    } catch (e) {
+      ServiceErrorHandler.handleError(
+        e, 
+        module: module, 
+        operation: 'updateStatus',
+        data: {'poId': poId, 'newStatus': newStatus},
+      );
+      rethrow;
+    }
+  }
+  
+  /// Validate PO status transition
+  void _validateStatusTransition(String currentStatus, String newStatus) {
+    // Define valid transitions
+    final validTransitions = {
+      'draft': ['pending', 'cancelled'],
+      'pending': ['approved', 'rejected', 'cancelled'],
+      'approved': ['ordered', 'cancelled'],
+      'ordered': ['partial_received', 'received', 'cancelled'],
+      'partial_received': ['received', 'cancelled'],
+      'received': ['completed'],
+      'rejected': ['pending', 'cancelled'],
+      'cancelled': [],
+      'completed': [],
+    };
+    
+    if (!validTransitions.containsKey(currentStatus)) {
+      throw BusinessException('Invalid current status: $currentStatus', module: module);
+    }
+    
+    if (!validTransitions[currentStatus]!.contains(newStatus)) {
+      throw BusinessException(
+        'Invalid status transition: $currentStatus -> $newStatus', 
+        module: module,
+      );
+    }
+  }
+  
+  /// Update inventory when PO is received
+  Future<void> _receiveInventory(String poId) async {
+    try {
+      // Get line items
+      final lineItemsSnapshot = await FirebaseFirestore.instance
+          .collection('po_line_items')
+          .where('po_id', isEqualTo: poId)
+          .get();
+          
+      // Process each line item
+      for (final doc in lineItemsSnapshot.docs) {
+        final lineItem = PoLineItem.fromFirestore(doc);
+        
+        // Find inventory item for this product
+        final inventorySnapshot = await FirebaseFirestore.instance
+            .collection('inventory')
+            .where('product_id', isEqualTo: lineItem.productId)
+            .limit(1)
+            .get();
+            
+        if (inventorySnapshot.docs.isNotEmpty) {
+          // Update existing inventory
+          final inventoryId = inventorySnapshot.docs.first.id;
+          await _inventoryService.updateStock(
+            inventoryId, 
+            lineItem.quantity, 
+            'PO Received: $poId',
+          );
+        } else {
+          // Create new inventory item
+          final inventoryId = const Uuid().v4();
+          await FirebaseFirestore.instance.collection('inventory').doc(inventoryId).set({
+            'inventory_id': inventoryId,
+            'product_id': lineItem.productId,
+            'warehouse_id': 'default', // Use default warehouse
+            'current_stock': lineItem.quantity,
+            'min_stock_level': 0, // Default values
+            'max_stock_level': 1000, // Default values
+            'created_at': FieldValue.serverTimestamp(),
+            'updated_at': FieldValue.serverTimestamp(),
+            'created_by': FirebaseAuth.instance.currentUser?.uid,
+            'updated_by': FirebaseAuth.instance.currentUser?.uid,
+          });
+          
+          // Log stock movement
+          await FirebaseFirestore.instance.collection('stock_movements').add({
+            'inventory_id': inventoryId,
+            'product_id': lineItem.productId,
+            'warehouse_id': 'default',
+            'quantity': lineItem.quantity,
+            'previous_stock': 0,
+            'new_stock': lineItem.quantity,
+            'reason': 'PO Received: $poId',
+            'timestamp': FieldValue.serverTimestamp(),
+            'user_id': FirebaseAuth.instance.currentUser?.uid,
+          });
+        }
+      }
+    } catch (e) {
+      ServiceErrorHandler.handleError(
+        e, 
+        module: module, 
+        operation: '_receiveInventory',
+        data: {'poId': poId},
+      );
+      rethrow;
+    }
+  }
+  
+  /// Get status history for a PO
+  Stream<QuerySnapshot> getStatusHistory(String poId) {
+    return FirebaseFirestore.instance
+        .collection('po_status_history')
+        .where('po_id', isEqualTo: poId)
+        .orderBy('timestamp', descending: true)
+        .snapshots();
+  }
+}
+
+/// Customer Order service
+class CustomerOrderService extends BaseService<Order> {
+  final ProductService _productService;
+  final InventoryService _inventoryService;
+  final CustomerProfileService _customerService;
+  
+  CustomerOrderService({
+    FirebaseFirestore? firestore,
+    AuditService? auditService,
+    ValidationService? validationService,
+    CacheService? cacheService,
+    ProductService? productService,
+    InventoryService? inventoryService,
+    CustomerProfileService? customerService,
+  }) : 
+    _productService = productService ?? ProductService(),
+    _inventoryService = inventoryService ?? InventoryService(),
+    _customerService = customerService ?? CustomerProfileService(),
+    super(
+      collectionPath: 'orders',
+      entityType: 'customer_order',
+      module: 'customer_order_management',
+      firestore: firestore,
+      auditService: auditService,
+      validationService: validationService,
+      cacheService: cacheService,
+    );
+  
+  @override
+  Order fromFirestore(DocumentSnapshot doc) {
+    return Order.fromFirestore(doc);
+  }
+  
+  @override
+  Map<String, dynamic> toFirestore(Order item) {
+    return item.toMap();
+  }
+  
+  @override
+  String getItemId(Order item) {
+    return item.orderId;
+  }
+  
+  /// Get orders by customer
+  Stream<List<Order>> getByCustomer(String customerId) {
+    return getAll(filters: {'customer_id': customerId});
+  }
+  
+  /// Get orders by status
+  Stream<List<Order>> getByStatus(String status) {
+    return getAll(filters: {'order_status': status});
+  }
+  
+  /// Create order with line items
+  Future<Order> createWithLineItems(
+    Order order, 
+    List<Map<String, dynamic>> lineItems
+  ) async {
+    try {
+      // Start a transaction
+      return await FirebaseFirestore.instance.runTransaction<Order>((transaction) async {
+        // First, validate the order and line items
+        final orderData = toFirestore(order);
+        
+        _validationService.validateData(
+          'customer_order', 
+          orderData, 
+          lineItems: lineItems,
+        );
+        
+        // Check inventory availability
+        for (final item in lineItems) {
+          final productId = item['product_id'];
+          final quantity = item['quantity'] ?? 0;
+          
+          final hasStock = await _inventoryService.hasSufficientStock(productId, quantity);
+          if (!hasStock) {
+            throw BusinessException(
+              'Insufficient stock for product ID: $productId', 
+              module: module,
+            );
+          }
+        }
+        
+        // Set metadata
+        final currentUser = FirebaseAuth.instance.currentUser;
+        final now = Timestamp.now();
+        
+        orderData['created_at'] = now;
+        orderData['updated_at'] = now;
+        orderData['created_by'] = currentUser?.uid;
+        orderData['updated_by'] = currentUser?.uid;
+        
+        // Generate order number if not provided
+        if (order.orderNumber.isEmpty) {
+          final timestamp = DateTime.now().millisecondsSinceEpoch;
+          orderData['order_number'] = 'ORD-${timestamp.toString().substring(timestamp.toString().length - 6)}';
+        }
+        
+        // Get ID from order or generate a new one
+        final orderId = order.orderId.isEmpty ? const Uuid().v4() : order.orderId;
+        final orderRef = document(orderId);
+        
+        if (order.orderId.isEmpty) {
+          orderData['order_id'] = orderId;
+        }
+        
+        // Calculate total amount from line items
+        double totalAmount = 0;
+        for (final lineItem in lineItems) {
+          final unitPrice = lineItem['unit_price'] ?? 0.0;
+          final quantity = lineItem['quantity'] ?? 0;
+          totalAmount += (unitPrice * quantity);
+        }
+        
+        // Update order with calculated total
+        orderData['total_amount'] = totalAmount;
+        
+        // Create the order
+        transaction.set(orderRef, orderData);
+        
+        // Create line items
+        for (int i = 0; i < lineItems.length; i++) {
+          final lineItem = lineItems[i];
+          
+          // Set metadata
+          lineItem['created_at'] = now;
+          lineItem['updated_at'] = now;
+          lineItem['created_by'] = currentUser?.uid;
+          lineItem['updated_by'] = currentUser?.uid;
+          
+          // Set order ID
+          lineItem['order_id'] = orderId;
+          
+          // Generate line item ID if not provided
+          final lineItemId = lineItem['line_item_id'] ?? const Uuid().v4();
+          final lineItemRef = FirebaseFirestore.instance.collection('order_line_items').doc(lineItemId);
+          
+          lineItem['line_item_id'] = lineItemId;
+          
+          // Create the line item
+          transaction.set(lineItemRef, lineItem);
+          
+          // Update inventory
+          final productId = lineItem['product_id'];
+          final quantity = lineItem['quantity'] ?? 0;
+          
+          // Find inventory item for this product
+          final inventorySnapshot = await FirebaseFirestore.instance
+              .collection('inventory')
+              .where('product_id', isEqualTo: productId)
+              .limit(1)
+              .get();
+              
+          if (inventorySnapshot.docs.isNotEmpty) {
+            final inventoryId = inventorySnapshot.docs.first.id;
+            final inventoryData = inventorySnapshot.docs.first.data();
+            final currentStock = inventoryData['current_stock'] ?? 0;
+            
+            // Update inventory
+            transaction.update(
+              FirebaseFirestore.instance.collection('inventory').doc(inventoryId),
+              {'current_stock': currentStock - quantity}
+            );
+            
+            // Log stock movement
+            final stockMovementRef = FirebaseFirestore.instance.collection('stock_movements').doc();
+            transaction.set(stockMovementRef, {
+              'inventory_id': inventoryId,
+              'product_id': productId,
+              'warehouse_id': inventoryData['warehouse_id'],
+              'quantity': -quantity,
+              'previous_stock': currentStock,
+              'new_stock': currentStock - quantity,
+              'reason': 'Order Created: ${orderData['order_number']}',
+              'timestamp': now,
+              'user_id': currentUser?.uid,
+            });
+          }
+        }
+        
+        // Update customer purchase history
+        final customerId = order.customerId;
+        final customerRef = FirebaseFirestore.instance.collection('customer_profiles').doc(customerId);
+        final customerDoc = await customerRef.get();
+        
+        if (customerDoc.exists) {
+          final customerData = customerDoc.data()!;
+          final totalPurchases = (customerData['total_purchases'] ?? 0) + 1;
+          final lifetimeValue = (customerData['lifetime_value'] ?? 0.0) + totalAmount;
+          
+          transaction.update(customerRef, {
+            'total_purchases': totalPurchases,
+            'lifetime_value': lifetimeValue,
+            'last_purchase_date': now,
+            'updated_at': now,
+          });
+        }
+        
+        // Return the created order with updated data
+        return Order(
+          orderId: orderId,
+          orderNumber: orderData['order_number'],
+          customerId: order.customerId,
+          orderDate: order.orderDate,
+          orderStatus: order.orderStatus,
+          totalAmount: totalAmount,
+          notes: order.notes,
+          paymentStatus: order.paymentStatus,
+          shippingAddress: order.shippingAddress,
+          billingAddress: order.billingAddress,
+          createdAt: now,
+          updatedAt: now,
+          createdBy: currentUser?.uid,
+          updatedBy: currentUser?.uid,
+        );
+      });
+    } catch (e) {
+      ServiceErrorHandler.handleError(
+        e, 
+        module: module, 
+        operation: 'createWithLineItems',
+        data: {'order': toFirestore(order), 'lineItemsCount': lineItems.length},
+      );
+      rethrow;
+    }
+  }
+  
+  /// Get line items for an order
+  Stream<QuerySnapshot> getLineItems(String orderId) {
+    return FirebaseFirestore.instance
+        .collection('order_line_items')
+        .where('order_id', isEqualTo: orderId)
+        .snapshots();
+  }
+  
+  /// Update order status
+  Future<Order> updateStatus(String orderId, String newStatus, {String? notes}) async {
+    try {
+      final docRef = document(orderId);
+      final orderDoc = await docRef.get();
+      
+      if (!orderDoc.exists) {
+        throw BusinessException('Order not found', module: module);
+      }
+      
+      final currentStatus = orderDoc.data()?['order_status'];
+      final currentUser = FirebaseAuth.instance.currentUser;
+      final now = FieldValue.serverTimestamp();
+      
+      // Validate status transition
+      _validateStatusTransition(currentStatus, newStatus);
+      
+      // Update the order
+      await docRef.update({
+        'order_status': newStatus,
+        'updated_at': now,
+        'updated_by': currentUser?.uid,
+      });
+      
+      // Log status change
+      await FirebaseFirestore.instance.collection('order_status_history').add({
+        'order_id': orderId,
+        'previous_status': currentStatus,
+        'new_status': newStatus,
+        'notes': notes,
+        'timestamp': now,
+        'user_id': currentUser?.uid,
+      });
+      
+      // If status is 'cancelled', restore inventory
+      if (newStatus == 'cancelled' && currentStatus != 'cancelled') {
+        await _restoreInventory(orderId);
+      }
+      
+      // Log audit trail
+      await _auditService.logActivity(
+        module: module,
+        action: 'update_status',
+        entityType: entityType,
+        entityId: orderId,
+        before: {'order_status': currentStatus},
+        after: {'order_status': newStatus},
+        notes: 'Updated order status: $currentStatus -> $newStatus${notes != null ? " ($notes)" : ""}',
+      );
+      
+      // Get the updated order
+      final updatedDoc = await docRef.get();
+      final updatedOrder = fromFirestore(updatedDoc);
+      
+      // Update cache
+      _cacheService.set('$entityType:$orderId', updatedOrder);
+      
+      return updatedOrder;
+    } catch (e) {
+      ServiceErrorHandler.handleError(
+        e, 
+        module: module, 
+        operation: 'updateStatus',
+        data: {'orderId': orderId, 'newStatus': newStatus},
+      );
+      rethrow;
+    }
+  }
+  
+  /// Validate order status transition
+  void _validateStatusTransition(String currentStatus, String newStatus) {
+    // Define valid transitions
+    final validTransitions = {
+      'pending': ['processing', 'cancelled'],
+      'processing': ['shipped', 'cancelled'],
+      'shipped': ['delivered', 'returned'],
+      'delivered': ['completed', 'returned'],
+      'returned': ['refunded', 'exchange_pending'],
+      'refunded': ['completed'],
+      'exchange_pending': ['processing'],
+      'cancelled': [],
+      'completed': [],
+    };
+    
+    if (!validTransitions.containsKey(currentStatus)) {
+      throw BusinessException('Invalid current status: $currentStatus', module: module);
+    }
+    
+    if (!validTransitions[currentStatus]!.contains(newStatus)) {
+      throw BusinessException(
+        'Invalid status transition: $currentStatus -> $newStatus', 
+        module: module,
+      );
+    }
+  }
+  
+  /// Restore inventory when order is cancelled
+  Future<void> _restoreInventory(String orderId) async {
+    try {
+      // Get line items
+      final lineItemsSnapshot = await FirebaseFirestore.instance
+          .collection('order_line_items')
+          .where('order_id', isEqualTo: orderId)
+          .get();
+          
+      // Process each line item
+      for (final doc in lineItemsSnapshot.docs) {
+        final lineItemData = doc.data();
+        final productId = lineItemData['product_id'];
+        final quantity = lineItemData['quantity'] ?? 0;
+        
+        // Find inventory item for this product
+        final inventorySnapshot = await FirebaseFirestore.instance
+            .collection('inventory')
+            .where('product_id', isEqualTo: productId)
+            .limit(1)
+            .get();
+            
+        if (inventorySnapshot.docs.isNotEmpty) {
+          // Update existing inventory
+          final inventoryId = inventorySnapshot.docs.first.id;
+          await _inventoryService.updateStock(
+            inventoryId, 
+            quantity, // Positive to add back to inventory
+            'Order Cancelled: $orderId',
+          );
+        }
+      }
+    } catch (e) {
+      ServiceErrorHandler.handleError(
+        e, 
+        module: module, 
+        operation: '_restoreInventory',
+        data: {'orderId': orderId},
+      );
+      rethrow;
+    }
+  }
+  
+  /// Get status history for an order
+  Stream<QuerySnapshot> getStatusHistory(String orderId) {
+    return FirebaseFirestore.instance
+        .collection('order_status_history')
+        .where('order_id', isEqualTo: orderId)
+        .orderBy('timestamp', descending: true)
+        .snapshots();
+  }
+}
+
+/// Customer Profile service
+class CustomerProfileService extends BaseService<CustomerProfile> {
+  CustomerProfileService({
+    FirebaseFirestore? firestore,
+    AuditService? auditService,
+    ValidationService? validationService,
+    CacheService? cacheService,
+  }) : super(
+    collectionPath: 'customer_profiles',
+    entityType: 'customer_profile',
+    module: 'customer_relationship_management',
+    firestore: firestore,
+    auditService: auditService,
+    validationService: validationService,
+    cacheService: cacheService,
+  );
+  
+  @override
+  CustomerProfile fromFirestore(DocumentSnapshot doc) {
+    return CustomerProfile.fromFirestore(doc);
+  }
+  
+  @override
+  Map<String, dynamic> toFirestore(CustomerProfile item) {
+    return item.toMap();
+  }
+  
+  @override
+  String getItemId(CustomerProfile item) {
+    return item.customerId;
+  }
+  
+  /// Get customers by segment
+  Stream<List<CustomerProfile>> getBySegment(String segment) {
+    return getAll(filters: {'segment': segment});
+  }
+  
+  /// Search customers by name
+  Future<List<CustomerProfile>> searchByName(String query) {
+    return searchByField('customer_name', query);
+  }
+  
+  /// Calculate customer segments
+  Future<void> calculateCustomerSegments() async {
+    try {
+      // Get all customers
+      final snapshot = await collection().get();
+      final customers = snapshot.docs.map((doc) => fromFirestore(doc)).toList();
+      
+      // Calculate metrics for segmentation
+      double totalLifetimeValue = 0;
+      int totalPurchases = 0;
+      
+      for (final customer in customers) {
+        totalLifetimeValue += customer.lifetimeValue ?? 0;
+        totalPurchases += customer.totalPurchases ?? 0;
+      }
+      
+      final avgLifetimeValue = totalLifetimeValue / customers.length;
+      final avgPurchases = totalPurchases / customers.length;
+      
+      // Update segments
+      final batch = FirebaseFirestore.instance.batch();
+      
+      for (final customer in customers) {
+        final customerId = customer.customerId;
+        final docRef = document(customerId);
+        
+        String segment;
+        if ((customer.lifetimeValue ?? 0) > avgLifetimeValue * 1.5) {
+          if ((customer.totalPurchases ?? 0) > avgPurchases * 1.5) {
+            segment = 'VIP';
+          } else {
+            segment = 'High Value';
+          }
+        } else if ((customer.totalPurchases ?? 0) > avgPurchases * 1.5) {
+          segment = 'Loyal';
+        } else if ((customer.lifetimeValue ?? 0) < avgLifetimeValue * 0.5) {
+          segment = 'At Risk';
+        } else {
+          segment = 'Regular';
+        }
+        
+        batch.update(docRef, {
+          'segment': segment,
+          'updated_at': FieldValue.serverTimestamp(),
+        });
+      }
+      
+      await batch.commit();
+      
+      // Log audit trail
+      await _auditService.logActivity(
+        module: module,
+        action: 'calculate_segments',
+        entityType: entityType,
+        entityId: 'batch',
+        notes: 'Calculated segments for ${customers.length} customers',
+      );
+      
+      // Clear cache for all customers
+      for (final customer in customers) {
+        _cacheService.remove('$entityType:${customer.customerId}');
+      }
+    } catch (e) {
+      ServiceErrorHandler.handleError(
+        e, 
+        module: module, 
+        operation: 'calculateCustomerSegments',
+      );
+      rethrow;
+    }
+  }
+}
+
+/// User Profile service
+class UserProfileService extends BaseService<UserProfile> {
+  UserProfileService({
+    FirebaseFirestore? firestore,
+    AuditService? auditService,
+    ValidationService? validationService,
+    CacheService? cacheService,
+  }) : super(
+    collectionPath: 'users',
+    entityType: 'user_profile',
+    module: 'user_management',
+    firestore: firestore,
+    auditService: auditService,
+    validationService: validationService,
+    cacheService: cacheService,
+  );
+  
+  @override
+  UserProfile fromFirestore(DocumentSnapshot doc) {
+    return UserProfile.fromFirestore(doc);
+  }
+  
+  @override
+  Map<String, dynamic> toFirestore(UserProfile item) {
+    return item.toMap();
+  }
+  
+  @override
+  String getItemId(UserProfile item) {
+    return item.userId;
+  }
+  
+  /// Get users by role
+  Stream<List<UserProfile>> getByRole(String role) {
+    return getAll(filters: {'role': role});
+  }
+  
+  /// Get current user profile
+  Future<UserProfile?> getCurrentUserProfile() async {
+    try {
+      final currentUser = FirebaseAuth.instance.currentUser;
+      if (currentUser == null) {
+        return null;
+      }
+      
+      return getById(currentUser.uid);
+    } catch (e) {
+      ServiceErrorHandler.handleError(

@@ -1,0 +1,563 @@
+import 'package:cloud_firestore/cloud_firestore.dart';
+import 'package:firebase_auth/firebase_auth.dart';
+import 'package:firebase_storage/firebase_storage.dart';
+import 'package:flutter/foundation.dart';
+import 'package:flutter_riverpod/flutter_riverpod.dart';
+import 'package:uuid/uuid.dart';
+
+import '../models/product.dart';
+import '../models/inventory_models.dart';
+import '../models/supplier.dart';
+import '../models/purchase_order.dart';
+import '../models/order.dart';
+import '../models/customer_profile.dart';
+import '../models/user_profile.dart';
+
+// Simple model classes for line items
+class PoLineItem {
+  final String lineItemId;
+  final String poId;
+  final String productId;
+  final int quantity;
+  final double unitPrice;
+
+  PoLineItem({
+    required this.lineItemId,
+    required this.poId,
+    required this.productId,
+    required this.quantity,
+    required this.unitPrice,
+  });
+}
+
+class OrderItem {
+  final String orderItemId;
+  final String orderId;
+  final String productId;
+  final int quantity;
+  final double unitPrice;
+
+  OrderItem({
+    required this.orderItemId,
+    required this.orderId,
+    required this.productId,
+    required this.quantity,
+    required this.unitPrice,
+  });
+}
+
+class InventoryItem {
+  final String inventoryId;
+  final String productId;
+  final int currentStock;
+  final int minStockLevel;
+  final int maxStockLevel;
+  final Timestamp createdAt;
+  final Timestamp updatedAt;
+
+  InventoryItem({
+    required this.inventoryId,
+    required this.productId,
+    required this.currentStock,
+    required this.minStockLevel,
+    required this.maxStockLevel,
+    required this.createdAt,
+    required this.updatedAt,
+  });
+
+  Map<String, dynamic> toMap() {
+    return {
+      'product_id': productId,
+      'current_stock': currentStock,
+      'min_stock_level': minStockLevel,
+      'max_stock_level': maxStockLevel,
+      'created_at': createdAt,
+      'updated_at': updatedAt,
+    };
+  }
+
+  factory InventoryItem.fromFirestore(DocumentSnapshot doc) {
+    final data = doc.data() as Map<String, dynamic>;
+    return InventoryItem(
+      inventoryId: doc.id,
+      productId: data['product_id'] ?? '',
+      currentStock: (data['current_stock'] ?? 0),
+      minStockLevel: (data['min_stock_level'] ?? 0),
+      maxStockLevel: (data['max_stock_level'] ?? 100),
+      createdAt: data['created_at'] ?? Timestamp.now(),
+      updatedAt: data['updated_at'] ?? Timestamp.now(),
+    );
+  }
+}
+
+// Simple cache service
+class CacheService {
+  final Map<String, dynamic> _cache = {};
+  
+  T? get<T>(String key) {
+    return _cache[key] as T?;
+  }
+  
+  void set<T>(String key, T value) {
+    _cache[key] = value;
+  }
+  
+  void remove(String key) {
+    _cache.remove(key);
+  }
+  
+  void clear() {
+    _cache.clear();
+  }
+}
+
+// Base service with common CRUD operations
+abstract class BaseService<T> {
+  final String collection;
+  final FirebaseFirestore _firestore = FirebaseFirestore.instance;
+  final CacheService _cache;
+  
+  BaseService(this.collection, this._cache);
+  
+  // Abstract methods to be implemented by subclasses
+  T fromFirestore(DocumentSnapshot doc);
+  Map<String, dynamic> toFirestore(T entity);
+  
+  // Create operation
+  Future<T?> create(T entity) async {
+    try {
+      final data = toFirestore(entity);
+      
+      // Add timestamps
+      data['created_at'] = FieldValue.serverTimestamp();
+      data['updated_at'] = FieldValue.serverTimestamp();
+      
+      // Add user info if available
+      final user = FirebaseAuth.instance.currentUser;
+      if (user != null) {
+        data['created_by'] = user.uid;
+        data['updated_by'] = user.uid;
+      }
+      
+      // Create document
+      final docRef = await _firestore.collection(collection).add(data);
+      final doc = await docRef.get();
+      
+      // Cache the result
+      final result = fromFirestore(doc);
+      _cache.set('${collection}:${doc.id}', result);
+      
+      return result;
+    } catch (e) {
+      debugPrint('Error creating $collection: $e');
+      return null;
+    }
+  }
+  
+  // Read operation - get by ID
+  Future<T?> getById(String id) async {
+    try {
+      // Check cache first
+      final cached = _cache.get<T>('${collection}:$id');
+      if (cached != null) return cached;
+      
+      // Get from Firestore
+      final doc = await _firestore.collection(collection).doc(id).get();
+      if (!doc.exists) return null;
+      
+      // Cache and return
+      final result = fromFirestore(doc);
+      _cache.set('${collection}:$id', result);
+      return result;
+    } catch (e) {
+      debugPrint('Error getting $collection by ID: $e');
+      return null;
+    }
+  }
+  
+  // Read operation - get all
+  Stream<List<T>> getAll() {
+    try {
+      return _firestore
+        .collection(collection)
+        .where('deleted_at', isNull: true)
+        .snapshots()
+        .map((snapshot) => snapshot.docs.map((doc) => fromFirestore(doc)).toList());
+    } catch (e) {
+      debugPrint('Error getting all $collection: $e');
+      return Stream.value([]);
+    }
+  }
+  
+  // Update operation
+  Future<T?> update(String id, T entity) async {
+    try {
+      final data = toFirestore(entity);
+      
+      // Update timestamp
+      data['updated_at'] = FieldValue.serverTimestamp();
+      
+      // Add user info if available
+      final user = FirebaseAuth.instance.currentUser;
+      if (user != null) {
+        data['updated_by'] = user.uid;
+      }
+      
+      // Update document
+      await _firestore.collection(collection).doc(id).update(data);
+      
+      // Remove from cache
+      _cache.remove('${collection}:$id');
+      
+      // Get updated document
+      return await getById(id);
+    } catch (e) {
+      debugPrint('Error updating $collection: $e');
+      return null;
+    }
+  }
+  
+  // Delete operation (soft delete)
+  Future<bool> delete(String id) async {
+    try {
+      // Soft delete
+      await _firestore.collection(collection).doc(id).update({
+        'deleted_at': FieldValue.serverTimestamp(),
+        'deleted_by': FirebaseAuth.instance.currentUser?.uid,
+      });
+      
+      // Remove from cache
+      _cache.remove('${collection}:$id');
+      
+      return true;
+    } catch (e) {
+      debugPrint('Error deleting $collection: $e');
+      return false;
+    }
+  }
+}
+
+// Product Service
+class ProductService extends BaseService<Product> {
+  ProductService(CacheService cache) : super('products', cache);
+  
+  @override
+  Product fromFirestore(DocumentSnapshot doc) {
+    return Product.fromFirestore(doc);
+  }
+  
+  @override
+  Map<String, dynamic> toFirestore(Product entity) {
+    return entity.toMap();
+  }
+  
+  // Get products by category
+  Stream<List<Product>> getByCategory(String category) {
+    try {
+      return FirebaseFirestore.instance
+        .collection('products')
+        .where('category', isEqualTo: category)
+        .where('deleted_at', isNull: true)
+        .snapshots()
+        .map((snapshot) => snapshot.docs.map((doc) => fromFirestore(doc)).toList());
+    } catch (e) {
+      debugPrint('Error getting products by category: $e');
+      return Stream.value([]);
+    }
+  }
+}
+
+// Inventory Service
+class InventoryService extends BaseService<InventoryItem> {
+  InventoryService(CacheService cache) : super('inventory', cache);
+  
+  @override
+  InventoryItem fromFirestore(DocumentSnapshot doc) {
+    return InventoryItem.fromFirestore(doc);
+  }
+  
+  @override
+  Map<String, dynamic> toFirestore(InventoryItem entity) {
+    return entity.toMap();
+  }
+  
+  // Get inventory by product ID
+  Future<InventoryItem?> getByProductId(String productId) async {
+    try {
+      final snapshot = await FirebaseFirestore.instance
+        .collection('inventory')
+        .where('product_id', isEqualTo: productId)
+        .limit(1)
+        .get();
+      
+      if (snapshot.docs.isEmpty) return null;
+      return fromFirestore(snapshot.docs.first);
+    } catch (e) {
+      debugPrint('Error getting inventory by product ID: $e');
+      return null;
+    }
+  }
+  
+  // Adjust inventory quantity
+  Future<bool> adjustQuantity(String inventoryId, int adjustment) async {
+    try {
+      final doc = await FirebaseFirestore.instance
+        .collection('inventory')
+        .doc(inventoryId)
+        .get();
+      
+      if (!doc.exists) return false;
+      
+      final data = doc.data()!;
+      final currentStock = data['current_stock'] as int? ?? 0;
+      final newStock = currentStock + adjustment;
+      
+      if (newStock < 0) return false;
+      
+      await FirebaseFirestore.instance
+        .collection('inventory')
+        .doc(inventoryId)
+        .update({
+          'current_stock': newStock,
+          'updated_at': FieldValue.serverTimestamp(),
+        });
+      
+      return true;
+    } catch (e) {
+      debugPrint('Error adjusting inventory quantity: $e');
+      return false;
+    }
+  }
+}
+
+// Supplier Service
+class SupplierService extends BaseService<Supplier> {
+  SupplierService(CacheService cache) : super('suppliers', cache);
+  
+  @override
+  Supplier fromFirestore(DocumentSnapshot doc) {
+    return Supplier.fromFirestore(doc);
+  }
+  
+  @override
+  Map<String, dynamic> toFirestore(Supplier entity) {
+    return entity.toMap();
+  }
+}
+
+// Purchase Order Service
+class PurchaseOrderService extends BaseService<PurchaseOrder> {
+  final InventoryService _inventoryService;
+  
+  PurchaseOrderService(CacheService cache, this._inventoryService) 
+    : super('purchase_orders', cache);
+  
+  @override
+  PurchaseOrder fromFirestore(DocumentSnapshot doc) {
+    return PurchaseOrder.fromFirestore(doc);
+  }
+  
+  @override
+  Map<String, dynamic> toFirestore(PurchaseOrder entity) {
+    return entity.toMap();
+  }
+  
+  // Create PO with line items
+  Future<PurchaseOrder?> createWithLineItems(PurchaseOrder po, List<PoLineItem> lineItems) async {
+    try {
+      // Start a batch
+      final batch = FirebaseFirestore.instance.batch();
+      
+      // Create PO document
+      final poData = toFirestore(po);
+      poData['po_number'] = 'PO-${DateTime.now().millisecondsSinceEpoch}';
+      poData['created_at'] = FieldValue.serverTimestamp();
+      poData['updated_at'] = FieldValue.serverTimestamp();
+      
+      // Calculate total
+      double total = 0;
+      for (final item in lineItems) {
+        total += item.quantity * item.unitPrice;
+      }
+      poData['total_amount'] = total;
+      
+      final poRef = FirebaseFirestore.instance.collection('purchase_orders').doc();
+      batch.set(poRef, poData);
+      
+      // Create line items
+      for (final item in lineItems) {
+        final itemData = {
+          'po_id': poRef.id,
+          'product_id': item.productId,
+          'quantity': item.quantity,
+          'unit_price': item.unitPrice,
+          'created_at': FieldValue.serverTimestamp(),
+        };
+        
+        final itemRef = FirebaseFirestore.instance.collection('po_line_items').doc();
+        batch.set(itemRef, itemData);
+      }
+      
+      // Commit batch
+      await batch.commit();
+      
+      // Get created PO
+      return await getById(poRef.id);
+    } catch (e) {
+      debugPrint('Error creating PO with line items: $e');
+      return null;
+    }
+  }
+  
+  // Update PO status
+  Future<bool> updateStatus(String poId, String status) async {
+    try {
+      await FirebaseFirestore.instance
+        .collection('purchase_orders')
+        .doc(poId)
+        .update({
+          'po_status': status,
+          'updated_at': FieldValue.serverTimestamp(),
+        });
+      
+      // If received, update inventory
+      if (status == 'received') {
+        final lineItems = await getLineItems(poId);
+        for (final item in lineItems) {
+          final inventory = await _inventoryService.getByProductId(item.productId);
+          if (inventory != null) {
+            await _inventoryService.adjustQuantity(inventory.inventoryId, item.quantity);
+          }
+        }
+      }
+      
+      return true;
+    } catch (e) {
+      debugPrint('Error updating PO status: $e');
+      return false;
+    }
+  }
+  
+  // Get line items for a PO
+  Future<List<PoLineItem>> getLineItems(String poId) async {
+    try {
+      final snapshot = await FirebaseFirestore.instance
+        .collection('po_line_items')
+        .where('po_id', isEqualTo: poId)
+        .get();
+      
+      return snapshot.docs.map((doc) {
+        final data = doc.data();
+        return PoLineItem(
+          lineItemId: doc.id,
+          poId: data['po_id'],
+          productId: data['product_id'],
+          quantity: data['quantity'],
+          unitPrice: data['unit_price'],
+        );
+      }).toList();
+    } catch (e) {
+      debugPrint('Error getting PO line items: $e');
+      return [];
+    }
+  }
+}
+
+// Customer Order Service
+class CustomerOrderService extends BaseService<Order> {
+  final InventoryService _inventoryService;
+  
+  CustomerOrderService(CacheService cache, this._inventoryService) 
+    : super('orders', cache);
+  
+  @override
+  Order fromFirestore(DocumentSnapshot doc) {
+    return Order.fromFirestore(doc);
+  }
+  
+  @override
+  Map<String, dynamic> toFirestore(Order entity) {
+    return entity.toMap();
+  }
+}
+
+// Customer Profile Service
+class CustomerProfileService extends BaseService<CustomerProfile> {
+  CustomerProfileService(CacheService cache) : super('customer_profiles', cache);
+  
+  @override
+  CustomerProfile fromFirestore(DocumentSnapshot doc) {
+    return CustomerProfile.fromFirestore(doc);
+  }
+  
+  @override
+  Map<String, dynamic> toFirestore(CustomerProfile entity) {
+    return entity.toMap();
+  }
+}
+
+// User Profile Service
+class UserProfileService extends BaseService<UserProfile> {
+  UserProfileService(CacheService cache) : super('users', cache);
+  
+  @override
+  UserProfile fromFirestore(DocumentSnapshot doc) {
+    return UserProfile.fromFirestore(doc);
+  }
+  
+  @override
+  Map<String, dynamic> toFirestore(UserProfile entity) {
+    return entity.toMap();
+  }
+  
+  // Get current user profile
+  Future<UserProfile?> getCurrentUserProfile() async {
+    try {
+      final user = FirebaseAuth.instance.currentUser;
+      if (user == null) return null;
+      return await getById(user.uid);
+    } catch (e) {
+      debugPrint('Error getting current user profile: $e');
+      return null;
+    }
+  }
+}
+
+// Provider definitions
+final cacheServiceProvider = Provider<CacheService>((ref) {
+  return CacheService();
+});
+
+final productServiceProvider = Provider<ProductService>((ref) {
+  return ProductService(ref.watch(cacheServiceProvider));
+});
+
+final inventoryServiceProvider = Provider<InventoryService>((ref) {
+  return InventoryService(ref.watch(cacheServiceProvider));
+});
+
+final supplierServiceProvider = Provider<SupplierService>((ref) {
+  return SupplierService(ref.watch(cacheServiceProvider));
+});
+
+final purchaseOrderServiceProvider = Provider<PurchaseOrderService>((ref) {
+  return PurchaseOrderService(
+    ref.watch(cacheServiceProvider),
+    ref.watch(inventoryServiceProvider),
+  );
+});
+
+final customerOrderServiceProvider = Provider<CustomerOrderService>((ref) {
+  return CustomerOrderService(
+    ref.watch(cacheServiceProvider),
+    ref.watch(inventoryServiceProvider),
+  );
+});
+
+final customerProfileServiceProvider = Provider<CustomerProfileService>((ref) {
+  return CustomerProfileService(ref.watch(cacheServiceProvider));
+});
+
+final userProfileServiceProvider = Provider<UserProfileService>((ref) {
+  return UserProfileService(ref.watch(cacheServiceProvider));
+});

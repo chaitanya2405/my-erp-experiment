@@ -1,0 +1,70 @@
+import 'package:firebase_dart/firebase_dart.dart';
+import 'screens/supplier_module_screen.dart';
+
+Future<void> main() async {
+  final app = await Firebase.initializeApp(
+    options: FirebaseOptions(
+      apiKey: "AIzaSyB9g3Ku_faWmuXKYVjI2S0qieXHf5OM2hQ",
+      authDomain: "ravali-software.firebaseapp.com",
+      projectId: "ravali-software",
+      storageBucket: "ravali-software.appspot.com",
+      messagingSenderId: "526643219487",
+      appId: "1:526643219487:web:6e3205e5f2102e6740192a",
+    ),
+  );
+
+  final firestore = FirebaseFirestore.instanceFor(app: app);
+
+  final modules = [
+    {'title': 'Product Management', 'icon': '🏷️'},
+    {'title': 'Inventory Management', 'icon': '📦'},
+    {'title': 'Supplier Management', 'icon': '🏭'},
+    {'title': 'Purchase Order (PO) Management', 'icon': '🧾'},
+    {'title': 'Store Management', 'icon': '🏬'},
+    {'title': 'CRM (Customer Relationship Management)', 'icon': '🧑‍🤝‍🧑'},
+    {'title': 'Customer Order Management (COM)', 'icon': '🛍️'},
+    {'title': 'POS (Point of Sale)', 'icon': '🖥️'},
+    {'title': 'Finance Management', 'icon': '💵'},
+    {'title': 'Dashboard & BI Analytics', 'icon': '📈'},
+    {'title': 'Logistics & Delivery Management', 'icon': '🚚'},
+    {'title': 'User Management & RBAC', 'icon': '🛡️'},
+    {'title': 'HR & Payroll Management', 'icon': '👔'},
+    {'title': 'Asset & Equipment Management', 'icon': '🛠️'},
+    {'title': 'Warehouse Management System (WMS)', 'icon': '🏢'},
+    {'title': 'Quality Control & Inspection', 'icon': '🧐'},
+    {'title': 'Expense & Budget Control', 'icon': '🧮'},
+    {'title': 'Audit & Compliance', 'icon': '🕵️‍♂️'},
+    {'title': 'Notification & Alert Engine', 'icon': '📣'},
+    {'title': 'Loyalty & Referral Engine', 'icon': '🎉'},
+    {'title': 'Marketing Campaign Manager', 'icon': '📢'},
+    {'title': 'API Gateway & External Integrations', 'icon': '🌐'},
+    {'title': 'Document Management System (DMS)', 'icon': '🗂️'},
+    {'title': 'Feedback & Complaint Management', 'icon': '🗣️'},
+    {'title': 'Franchise / Multi-brand Management', 'icon': '🏪'},
+    {'title': 'Sustainability & ESG Tracking', 'icon': '🌳'},
+    {'title': 'Knowledge Base / Internal Wiki', 'icon': '📖'},
+  ];
+
+  for (final module in modules) {
+    await firestore.collection('modules').add(module);
+    print('Added module: ${module['title']}');
+  }
+  print('All modules added!');
+
+  // Add Supplier Management module card/button
+  Card(
+    elevation: 2,
+    margin: const EdgeInsets.symmetric(vertical: 12),
+    child: ListTile(
+      leading: const Icon(Icons.business, color: Colors.deepPurple),
+      title: const Text('Supplier Management'),
+      subtitle: const Text('Manage suppliers, contracts, and analytics'),
+      onTap: () {
+        Navigator.push(
+          context,
+          MaterialPageRoute(builder: (_) => const SupplierModuleScreen()),
+        );
+      },
+    ),
+  );
+}

@@ -1,0 +1,2 @@
+# Placeholder animations directory
+# Add your Lottie animations here

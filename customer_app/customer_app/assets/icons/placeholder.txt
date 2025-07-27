@@ -1,0 +1,2 @@
+# Placeholder icons directory
+# Add your app icons here

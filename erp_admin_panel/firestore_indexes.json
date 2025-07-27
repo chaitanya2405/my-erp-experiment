@@ -1,0 +1,19 @@
+{
+  "indexes": [
+    {
+      "collectionGroup": "store_performance",
+      "queryScope": "COLLECTION",
+      "fields": [
+        {
+          "fieldPath": "store_id",
+          "order": "ASCENDING"
+        },
+        {
+          "fieldPath": "date",
+          "order": "DESCENDING"
+        }
+      ]
+    }
+  ],
+  "fieldOverrides": []
+}

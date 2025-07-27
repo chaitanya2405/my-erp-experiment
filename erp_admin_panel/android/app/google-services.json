@@ -1,0 +1,29 @@
+{
+  "project_info": {
+    "project_number": "526643219487",
+    "project_id": "ravali-software",
+    "storage_bucket": "ravali-software.firebasestorage.app"
+  },
+  "client": [
+    {
+      "client_info": {
+        "mobilesdk_app_id": "1:526643219487:android:760dbcc3f868a89940192a",
+        "android_client_info": {
+          "package_name": "com.example.ravali_software"
+        }
+      },
+      "oauth_client": [],
+      "api_key": [
+        {
+          "current_key": "AIzaSyCgscUniCDCo0FZr5B2WTIV7DSAtkK9ODw"
+        }
+      ],
+      "services": {
+        "appinvite_service": {
+          "other_platform_oauth_client": []
+        }
+      }
+    }
+  ],
+  "configuration_version": "1"
+}

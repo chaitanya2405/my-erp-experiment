@@ -1,0 +1,338 @@
+import 'package:cloud_firestore/cloud_firestore.dart';
+import 'package:firebase_auth/firebase_auth.dart';
+import 'package:flutter/foundation.dart';
+import 'package:flutter_riverpod/flutter_riverpod.dart';
+
+// ==========================================================================
+// MINIMAL MODEL DEFINITIONS
+// ==========================================================================
+// These classes provide the necessary structure for the services to function.
+// Ensure your actual model files in `lib/models/` match these fields and methods.
+
+class Product {
+  final String productId;
+  final String productName;
+  final String sku;
+  final String category;
+  final int minStockLevel;
+  final int maxStockLevel;
+
+  Product({
+    required this.productId,
+    required this.productName,
+    required this.sku,
+    required this.category,
+    this.minStockLevel = 10,
+    this.maxStockLevel = 100,
+  });
+
+  factory Product.fromFirestore(DocumentSnapshot doc) {
+    final data = doc.data() as Map<String, dynamic>? ?? {};
+    return Product(
+      productId: doc.id,
+      productName: data['product_name'] ?? '',
+      sku: data['sku'] ?? '',
+      category: data['category'] ?? 'Uncategorized',
+      minStockLevel: data['min_stock_level'] ?? 10,
+      maxStockLevel: data['max_stock_level'] ?? 100,
+    );
+  }
+
+  Map<String, dynamic> toMap() {
+    return {
+      'product_name': productName,
+      'sku': sku,
+      'category': category,
+      'min_stock_level': minStockLevel,
+      'max_stock_level': maxStockLevel,
+    };
+  }
+}
+
+class InventoryItem {
+  final String inventoryId;
+  final String productId;
+  final int currentStock;
+  final int minStockLevel;
+
+  InventoryItem({
+    required this.inventoryId,
+    required this.productId,
+    required this.currentStock,
+    required this.minStockLevel,
+  });
+
+  factory InventoryItem.fromFirestore(DocumentSnapshot doc) {
+    final data = doc.data() as Map<String, dynamic>? ?? {};
+    return InventoryItem(
+      inventoryId: doc.id,
+      productId: data['product_id'] ?? '',
+      currentStock: data['current_stock'] ?? 0,
+      minStockLevel: data['min_stock_level'] ?? 10,
+    );
+  }
+
+  Map<String, dynamic> toMap() {
+    return {
+      'product_id': productId,
+      'current_stock': currentStock,
+      'min_stock_level': minStockLevel,
+    };
+  }
+}
+
+class Supplier {
+  final String supplierId;
+  final String supplierName;
+
+  Supplier({required this.supplierId, required this.supplierName});
+
+  factory Supplier.fromFirestore(DocumentSnapshot doc) {
+    final data = doc.data() as Map<String, dynamic>? ?? {};
+    return Supplier(
+      supplierId: doc.id,
+      supplierName: data['supplier_name'] ?? '',
+    );
+  }
+
+  Map<String, dynamic> toMap() {
+    return {'supplier_name': supplierName};
+  }
+}
+
+class PurchaseOrder {
+  final String poId;
+  final String status;
+
+  PurchaseOrder({required this.poId, required this.status});
+
+  factory PurchaseOrder.fromFirestore(DocumentSnapshot doc) {
+    final data = doc.data() as Map<String, dynamic>? ?? {};
+    return PurchaseOrder(
+      poId: doc.id,
+      status: data['status'] ?? 'draft',
+    );
+  }
+
+  Map<String, dynamic> toMap() {
+    return {'status': status};
+  }
+}
+
+// Aliased to avoid conflict with Flutter's Order class
+class AppOrder {
+  final String orderId;
+  final String status;
+  final double totalValue;
+
+  AppOrder({required this.orderId, required this.status, required this.totalValue});
+
+  factory AppOrder.fromFirestore(DocumentSnapshot doc) {
+    final data = doc.data() as Map<String, dynamic>? ?? {};
+    return AppOrder(
+      orderId: doc.id,
+      status: data['status'] ?? 'pending',
+      totalValue: (data['total_value'] ?? 0.0).toDouble(),
+    );
+  }
+
+  Map<String, dynamic> toMap() {
+    return {
+      'status': status,
+      'total_value': totalValue,
+    };
+  }
+}
+
+class CustomerProfile {
+  final String customerId;
+  final String customerName;
+  final String? segment;
+
+  CustomerProfile({required this.customerId, required this.customerName, this.segment});
+
+  factory CustomerProfile.fromFirestore(DocumentSnapshot doc) {
+    final data = doc.data() as Map<String, dynamic>? ?? {};
+    return CustomerProfile(
+      customerId: doc.id,
+      customerName: data['customer_name'] ?? '',
+      segment: data['segment'] ?? 'Regular',
+    );
+  }
+
+  Map<String, dynamic> toMap() {
+    return {
+      'customer_name': customerName,
+      'segment': segment,
+    };
+  }
+}
+
+class UserProfile {
+  final String userId;
+  final String displayName;
+
+  UserProfile({required this.userId, required this.displayName});
+
+  factory UserProfile.fromFirestore(DocumentSnapshot doc) {
+    final data = doc.data() as Map<String, dynamic>? ?? {};
+    return UserProfile(
+      userId: doc.id,
+      displayName: data['display_name'] ?? 'No Name',
+    );
+  }
+
+  Map<String, dynamic> toMap() {
+    return {'display_name': displayName};
+  }
+}
+
+// ==========================================================================
+// CORE SERVICES
+// ==========================================================================
+
+class CacheService {
+  final Map<String, dynamic> _cache = {};
+  T? get<T>(String key) => _cache[key] as T?;
+  void set<T>(String key, T value) => _cache[key] = value;
+}
+
+abstract class BaseService<T> {
+  final String collectionPath;
+  final FirebaseFirestore _firestore = FirebaseFirestore.instance;
+  final CacheService _cache;
+
+  BaseService(this.collectionPath, this._cache);
+
+  T fromFirestore(DocumentSnapshot doc);
+  Map<String, dynamic> toFirestore(T entity);
+
+  Stream<List<T>> getAll() {
+    try {
+      return _firestore
+          .collection(collectionPath)
+          .where('deleted_at', isNull: true)
+          .snapshots()
+          .map((snapshot) => snapshot.docs.map((doc) => fromFirestore(doc)).toList());
+    } catch (e) {
+      debugPrint('Error getting all from $collectionPath: $e');
+      return Stream.value([]);
+    }
+  }
+
+  Future<T?> getById(String id) async {
+    try {
+      final cached = _cache.get<T>('$collectionPath:$id');
+      if (cached != null) return cached;
+      final doc = await _firestore.collection(collectionPath).doc(id).get();
+      if (!doc.exists) return null;
+      final result = fromFirestore(doc);
+      _cache.set('$collectionPath:$id', result);
+      return result;
+    } catch (e) {
+      debugPrint('Error getting from $collectionPath by ID: $e');
+      return null;
+    }
+  }
+}
+
+// ==========================================================================
+// MODULE-SPECIFIC SERVICES
+// ==========================================================================
+
+class ProductService extends BaseService<Product> {
+  ProductService(CacheService cache) : super('products', cache);
+  @override
+  Product fromFirestore(DocumentSnapshot doc) => Product.fromFirestore(doc);
+  @override
+  Map<String, dynamic> toFirestore(Product entity) => entity.toMap();
+}
+
+class InventoryService extends BaseService<InventoryItem> {
+  InventoryService(CacheService cache) : super('inventory', cache);
+  @override
+  InventoryItem fromFirestore(DocumentSnapshot doc) => InventoryItem.fromFirestore(doc);
+  @override
+  Map<String, dynamic> toFirestore(InventoryItem entity) => entity.toMap();
+}
+
+class SupplierService extends BaseService<Supplier> {
+  SupplierService(CacheService cache) : super('suppliers', cache);
+  @override
+  Supplier fromFirestore(DocumentSnapshot doc) => Supplier.fromFirestore(doc);
+  @override
+  Map<String, dynamic> toFirestore(Supplier entity) => entity.toMap();
+}
+
+class PurchaseOrderService extends BaseService<PurchaseOrder> {
+  PurchaseOrderService(CacheService cache) : super('purchase_orders', cache);
+  @override
+  PurchaseOrder fromFirestore(DocumentSnapshot doc) => PurchaseOrder.fromFirestore(doc);
+  @override
+  Map<String, dynamic> toFirestore(PurchaseOrder entity) => entity.toMap();
+}
+
+class CustomerOrderService extends BaseService<AppOrder> {
+  CustomerOrderService(CacheService cache) : super('orders', cache);
+  @override
+  AppOrder fromFirestore(DocumentSnapshot doc) => AppOrder.fromFirestore(doc);
+  @override
+  Map<String, dynamic> toFirestore(AppOrder entity) => entity.toMap();
+}
+
+class CustomerProfileService extends BaseService<CustomerProfile> {
+  CustomerProfileService(CacheService cache) : super('customer_profiles', cache);
+  @override
+  CustomerProfile fromFirestore(DocumentSnapshot doc) => CustomerProfile.fromFirestore(doc);
+  @override
+  Map<String, dynamic> toFirestore(CustomerProfile entity) => entity.toMap();
+}
+
+class UserProfileService extends BaseService<UserProfile> {
+  UserProfileService(CacheService cache) : super('users', cache);
+  @override
+  UserProfile fromFirestore(DocumentSnapshot doc) => UserProfile.fromFirestore(doc);
+  @override
+  Map<String, dynamic> toFirestore(UserProfile entity) => entity.toMap();
+
+  Future<UserProfile?> getCurrentUserProfile() async {
+    final user = FirebaseAuth.instance.currentUser;
+    if (user == null) return null;
+    return await getById(user.uid);
+  }
+}
+
+// ==========================================================================
+// RIVERPOD PROVIDERS
+// ==========================================================================
+
+final cacheServiceProvider = Provider<CacheService>((ref) => CacheService());
+
+final productServiceProvider = Provider<ProductService>((ref) {
+  return ProductService(ref.watch(cacheServiceProvider));
+});
+
+final inventoryServiceProvider = Provider<InventoryService>((ref) {
+  return InventoryService(ref.watch(cacheServiceProvider));
+});
+
+final supplierServiceProvider = Provider<SupplierService>((ref) {
+  return SupplierService(ref.watch(cacheServiceProvider));
+});
+
+final purchaseOrderServiceProvider = Provider<PurchaseOrderService>((ref) {
+  return PurchaseOrderService(ref.watch(cacheServiceProvider));
+});
+
+final customerOrderServiceProvider = Provider<CustomerOrderService>((ref) {
+  return CustomerOrderService(ref.watch(cacheServiceProvider));
+});
+
+final customerProfileServiceProvider = Provider<CustomerProfileService>((ref) {
+  return CustomerProfileService(ref.watch(cacheServiceProvider));
+});
+
+final userProfileServiceProvider = Provider<UserProfileService>((ref) {
+  return UserProfileService(ref.watch(cacheServiceProvider));
+});
+

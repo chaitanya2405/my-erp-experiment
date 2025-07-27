@@ -1,0 +1,19 @@
+// Firestore security rules for customer/supplier mobile app sync
+service cloud.firestore {
+  match /databases/{database}/documents {
+    // Only allow users to read/update their own profile
+    match /users/{userId} {
+      allow read, update: if request.auth != null && request.auth.uid == userId && resource.data.userType in ['customer', 'supplier'];
+      allow create: if request.auth != null;
+    }
+    // Example: Only allow customers to read their own orders
+    match /orders/{orderId} {
+      allow read, write: if request.auth != null && resource.data.customerId == request.auth.uid;
+    }
+    // Example: Only allow suppliers to read their own purchase orders
+    match /purchase_orders/{poId} {
+      allow read, write: if request.auth != null && resource.data.supplierId == request.auth.uid;
+    }
+    // Add more rules for other collections as needed
+  }
+}
